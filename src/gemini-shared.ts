@@ -305,10 +305,10 @@ async function resolveGeminiUploadTarget(
   readers: MediaReaders,
 ): Promise<{ file: Blob; mimeType: string } | null> {
   // All branches route through the single dispatch points readMediaBytes /
-  // readFileBytes — inContainer-aware reads + magic-byte mime sniff. Returns
-  // a Blob (rather than a path) so File API upload always receives the
-  // sniff-corrected mime and container-aware bytes; using `part.path` directly
-  // would bypass sandboxFs bridge for container-only paths.
+  // readFileBytes — host-supplied readers + magic-byte mime sniff. Returns
+  // a Blob (rather than a path) so the File API upload always receives the
+  // sniff-corrected mime and reader-resolved bytes; using `part.path` directly
+  // would bypass whatever bridge the host wired (sandbox, S3, etc.).
   let bytes: Buffer;
   let mimeType: string;
   try {
