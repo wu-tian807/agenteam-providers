@@ -35,9 +35,10 @@ export interface MediaReaders {
    *  carrying JPEG bytes gets the corrected `image/jpeg` here. */
   readMediaBytes(part: MediaInputPart): Promise<ReadResult>;
 
-  /** Read arbitrary file bytes (text_file / file / *_file). Same path
-   *  ownership rules as `readMediaBytes` — `inContainer === false` ⇒ host fs,
-   *  otherwise the consumer's sandbox bridge (if they wired one in). */
+  /** Read arbitrary file bytes (text_file / file / *_file). The host's
+   *  reader is the sole interpreter of `path` — it may route via a sandbox
+   *  bridge, fetch from S3, etc. `defaultMediaReaders` below treats `path`
+   *  as a literal host-fs path. */
   readFileBytes(part: FilePathPart): Promise<ReadResult>;
 }
 
@@ -45,12 +46,13 @@ export interface MediaReaders {
  * Default `MediaReaders` — pure async `node:fs.readFile` for path-based parts,
  * inline base64 decode for inline parts, mime sniff applied to both. Suitable
  * for any consumer whose model inputs reference real host filesystem paths
- * (CLI tools, scripts, plain server processes). Hosts that need a sandbox /
- * container bridge ship their own implementation and pass it via `deps.readers`.
+ * (CLI tools, scripts, plain server processes).
  *
- * The `inContainer` flag is ignored here — there's no bridge to route through
- * — every path resolves to a host-fs read. A consumer that uses
- * `inContainer === true` paths MUST replace this default.
+ * This default reads only `path` / inline `data`. It does NOT inspect any
+ * host-private augment fields the producer might have attached (those are
+ * a contract between the producer and the host's own `MediaReaders` impl).
+ * Hosts that need different routing semantics ship their own implementation
+ * and pass it via `deps.readers`.
  */
 export const defaultMediaReaders: MediaReaders = {
   async readMediaBytes(part) {
