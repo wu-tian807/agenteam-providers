@@ -14,6 +14,8 @@ export * from "./tool-normalizer.js";
 export * from "./media-mime-sniff.js";
 export * from "./image-compression.js";
 export * from "./provider.js";
+export * from "./aws-sigv4.js";
+export * from "./aws-eventstream.js";
 
 // Adapter helpers — exposed for white-box tests / advanced consumers that
 // want to hand-roll a request payload without going through `createProvider`.
@@ -42,6 +44,10 @@ export {
   messagesToGemini2,
   createGemini2Provider,
 } from "./gemini2.js";
+
+export {
+  createBedrockAnthropicProvider,
+} from "./aws-bedrock-anthropic.js";
 
 // Side-effect: register all built-in adapters with the registry. Importing
 // `@agenteam/providers` from anywhere in the host suffices to make

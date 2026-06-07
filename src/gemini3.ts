@@ -1,7 +1,7 @@
 /** Gemini 3.x adapter — thinkingLevel, thought signatures required on function calls */
 
 import { GoogleGenAI } from "@google/genai";
-import { registerProvider, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
+import { registerProvider, requireApiKey, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
 import type { LLMMessage, LLMProvider, LLMToolCall, ProviderSidecarData, StreamEvent } from "./types.js";
 import { annotateLLMError } from "./errors.js";
 import {
@@ -298,6 +298,8 @@ function createGemini3Provider(opts: ProviderFactoryOpts): LLMProvider {
   };
 }
 
-registerProvider("google-gemini-3", createGemini3Provider);
+registerProvider("google-gemini-3", createGemini3Provider, {
+  validateKey: requireApiKey,
+});
 
 export { createGemini3Provider };

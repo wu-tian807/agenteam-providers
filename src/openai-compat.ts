@@ -1,6 +1,6 @@
 /** OpenAI Chat Completions adapter — SSE streaming, multimodal */
 
-import { registerProvider, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
+import { registerProvider, requireApiKey, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
 import type { ContentPart, ReasoningEffort, ToolSchema } from "@agenteam/types";
 import { isInlineMediaContentPart } from "@agenteam/types";
 import type { LLMMessage, LLMProvider, StreamEvent, SystemBlock } from "./types.js";
@@ -633,6 +633,8 @@ function createOpenAICompatProvider(opts: ProviderFactoryOpts): LLMProvider {
   };
 }
 
-registerProvider("openai-completions", createOpenAICompatProvider);
+registerProvider("openai-completions", createOpenAICompatProvider, {
+  validateKey: requireApiKey,
+});
 
 export { createOpenAICompatProvider };
