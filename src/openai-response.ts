@@ -1,6 +1,6 @@
 // @desc OpenAI Responses API adapter — /v1/responses, SSE streaming, native multimodal tool output
 
-import { registerProvider, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
+import { registerProvider, requireApiKey, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
 import type { ContentPart, ReasoningEffort, ToolSchema } from "@agenteam/types";
 import { isInlineMediaContentPart } from "@agenteam/types";
 import type { LLMMessage, LLMProvider, StreamEvent, SystemBlock } from "./types.js";
@@ -684,6 +684,8 @@ function createOpenAIResponseProvider(opts: ProviderFactoryOpts): LLMProvider {
   };
 }
 
-registerProvider("openai-responses", createOpenAIResponseProvider);
+registerProvider("openai-responses", createOpenAIResponseProvider, {
+  validateKey: requireApiKey,
+});
 
 export { createOpenAIResponseProvider };

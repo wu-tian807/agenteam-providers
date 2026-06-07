@@ -72,7 +72,7 @@
  *    can split your cache hit rate in half.
  */
 
-import { registerProvider, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
+import { registerProvider, requireApiKey, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
 import type { ReasoningEffort } from "@agenteam/types";
 import type { LLMProvider, StreamEvent, SystemBlock, LLMMessage } from "./types.js";
 import { parseSSE } from "./stream.js";
@@ -475,6 +475,8 @@ function createClaudeOpenAICompatProvider(opts: ProviderFactoryOpts): LLMProvide
   };
 }
 
-registerProvider("claude-openai-compat", createClaudeOpenAICompatProvider);
+registerProvider("claude-openai-compat", createClaudeOpenAICompatProvider, {
+  validateKey: requireApiKey,
+});
 
 export { createClaudeOpenAICompatProvider };

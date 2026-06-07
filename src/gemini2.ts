@@ -1,7 +1,7 @@
 /** Gemini 2.x adapter — thinkingBudget, no thought signature requirements */
 
 import { GoogleGenAI } from "@google/genai";
-import { registerProvider, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
+import { registerProvider, requireApiKey, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
 import type { LLMMessage, LLMProvider } from "./types.js";
 import { annotateLLMError } from "./errors.js";
 import {
@@ -116,6 +116,8 @@ function createGemini2Provider(opts: ProviderFactoryOpts): LLMProvider {
   };
 }
 
-registerProvider("google-gemini-2", createGemini2Provider);
+registerProvider("google-gemini-2", createGemini2Provider, {
+  validateKey: requireApiKey,
+});
 
 export { createGemini2Provider };

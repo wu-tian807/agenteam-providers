@@ -1,6 +1,6 @@
 // @desc DeepSeek V4 provider — thinking mode toggle + reasoning_content replay for tool-call turns.
 
-import { registerProvider, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
+import { registerProvider, requireApiKey, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
 import type { LLMMessage, LLMProvider } from "./types.js";
 import {
   openAICompatStream,
@@ -69,6 +69,8 @@ function createDeepSeekV4Provider(opts: ProviderFactoryOpts): LLMProvider {
   };
 }
 
-registerProvider("deepseek-v4", createDeepSeekV4Provider);
+registerProvider("deepseek-v4", createDeepSeekV4Provider, {
+  validateKey: requireApiKey,
+});
 
 export { createDeepSeekV4Provider };

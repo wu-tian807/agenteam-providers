@@ -7,3 +7,4 @@ import "./openai-compat.js";
 import "./openai-response.js";
 import "./deepseek-v4.js";
 import "./claude-openai-compat.js";
+import "./aws-bedrock-anthropic.js";

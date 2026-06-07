@@ -1,6 +1,6 @@
 /** Anthropic Messages API adapter — SSE streaming, raw fetch, thinking support */
 
-import { registerProvider, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
+import { registerProvider, requireApiKey, downgradeEffort, type ProviderFactoryOpts } from "./provider.js";
 import type { ContentPart, ToolSchema } from "@agenteam/types";
 import type { LLMMessage, LLMProvider, StreamEvent, SystemBlock } from "./types.js";
 import { listSupported } from "./types.js";
@@ -18,7 +18,7 @@ import {
 } from "./image-compression.js";
 import { foldDynamicReminders } from "./dynamic-system.js";
 
-type AnthropicAssistantBlock =
+export type AnthropicAssistantBlock =
   | { type: "text"; text: string }
   | { type: "thinking"; thinking: string; signature?: string }
   | { type: "redacted_thinking"; data: string }
@@ -41,7 +41,7 @@ interface AnthropicSidecar {
  * Detect models that require adaptive-only thinking and reject sampling parameters.
  * Matches claude-opus-4-7, claude-opus-4-7-20260416, and any future opus >= 4.7.
  */
-function isAdaptiveOnlyModel(model: string): boolean {
+export function isAdaptiveOnlyModel(model: string): boolean {
   const match = model.match(/claude-opus-(\d+)-(\d+)/);
   if (!match) return false;
   const major = parseInt(match[1], 10);
@@ -55,7 +55,7 @@ function isAdaptiveOnlyModel(model: string): boolean {
  * Matches claude-opus-4-8 and its dated variants (e.g. claude-opus-4-8-20260519).
  * Do NOT extend to future models without verifying support.
  */
-function supportsMidConvoSystem(model: string): boolean {
+export function supportsMidConvoSystem(model: string): boolean {
   return /^claude-opus-4-8\b/i.test(model);
 }
 
@@ -64,7 +64,7 @@ function supportsMidConvoSystem(model: string): boolean {
  * Per Anthropic docs: claude-opus-4-6, 4-7, and 4-8 support fast mode.
  * Explicit allowlist — do NOT extend to future models without verifying support.
  */
-function supportsFastMode(model: string): boolean {
+export function supportsFastMode(model: string): boolean {
   return /^claude-opus-4-(?:6|7|8)\b/i.test(model);
 }
 
@@ -87,7 +87,7 @@ const IMAGE_POLICY: ImagePreflightPolicy = {
   supportedMimeTypes: ANTHROPIC_SUPPORTED_IMAGE_MIME_TYPES,
 };
 
-function toolDefsToAnthropic(tools?: ToolSchema[]) {
+export function toolDefsToAnthropic(tools?: ToolSchema[]) {
   if (!tools?.length) return undefined;
   return tools.map((t) => ({
     name: t.name,
@@ -386,7 +386,7 @@ async function messagesToAnthropic(messages: LLMMessage[], readers: MediaReaders
   return result;
 }
 
-function systemBlocksToAnthropic(blocks: SystemBlock[]): any[] {
+export function systemBlocksToAnthropic(blocks: SystemBlock[]): any[] {
   return blocks.map((block, i, arr) => {
     const entry: any = { type: "text", text: block.text };
     const nextIsNotStable = i === arr.length - 1 || arr[i + 1].cacheHint !== "stable";
@@ -397,7 +397,7 @@ function systemBlocksToAnthropic(blocks: SystemBlock[]): any[] {
   });
 }
 
-function annotateMessageCache(messages: any[]): void {
+export function annotateMessageCache(messages: any[]): void {
   // Anchor the cache marker to the LAST user turn on-wire. The carrier
   // architecture (history-pipeline + dynamic-system) makes every user / tool
   // turn — including the one that triggered this loop — byte-stable across
@@ -434,6 +434,154 @@ function annotateMessageCache(messages: any[]): void {
     ...content[markerIdx],
     cache_control: { type: "ephemeral" },
   };
+}
+
+/**
+ * Consume an Anthropic-format event stream and yield framework `StreamEvent`s.
+ *
+ * The input `events` async iterable yields `{event, data}` where `data` is
+ * ALREADY JSON-parsed. Native Anthropic (`/v1/messages`) wraps each chunk in a
+ * text/event-stream frame and feeds raw strings via `parseSSE`; Bedrock
+ * (`invoke-with-response-stream`) wraps them in AWS event-stream binary frames
+ * and decodes via `parseAwsEventStream`. Both converge on the SAME
+ * `{event, data}` post-parse shape — this helper is what they share.
+ *
+ * `providerLabel` (e.g. "anthropic" or "aws-bedrock-anthropic") feeds error
+ * annotation only; it does not change wire behavior.
+ */
+export async function* consumeAnthropicEvents(
+  events: AsyncIterable<{ event?: string; data: any }>,
+  signal: AbortSignal,
+  providerLabel: string,
+  model: string,
+): AsyncGenerator<StreamEvent, void, void> {
+  let currentBlock:
+    | { type: "text"; text: string }
+    | { type: "thinking"; thinking: string; signature?: string }
+    | { type: "redacted_thinking"; data: string }
+    | { type: "tool_use"; id?: string; name?: string; arguments: string }
+    | null = null;
+  const assistantBlocks: AnthropicAssistantBlock[] = [];
+  let outputTokens = 0;
+  let rawUsage: Record<string, unknown> | undefined;
+
+  for await (const { event, data: parsed } of events) {
+    if (signal.aborted) break;
+    if (!parsed) continue;
+
+    throwOnStreamError(parsed, providerLabel, model);
+
+    const eventType = event ?? parsed.type;
+
+    switch (eventType) {
+      case "message_start": {
+        if (parsed.message?.usage && typeof parsed.message.usage === "object") {
+          rawUsage = { ...(parsed.message.usage as Record<string, unknown>) };
+        }
+        break;
+      }
+      case "content_block_start": {
+        const block = parsed.content_block;
+        if (block?.type === "tool_use") {
+          currentBlock = { type: "tool_use", id: block.id, name: block.name, arguments: "" };
+        } else if (block?.type === "thinking") {
+          currentBlock = {
+            type: "thinking",
+            thinking: typeof block.thinking === "string" ? block.thinking : "",
+            signature: typeof block.signature === "string" ? block.signature : undefined,
+          };
+        } else if (block?.type === "redacted_thinking") {
+          currentBlock = {
+            type: "redacted_thinking",
+            data: typeof block.data === "string" ? block.data : "",
+          };
+        } else {
+          currentBlock = {
+            type: "text",
+            text: typeof block?.text === "string" ? block.text : "",
+          };
+        }
+        break;
+      }
+      case "content_block_delta": {
+        const delta = parsed.delta;
+        if (delta?.type === "text_delta" && delta.text) {
+          if (currentBlock?.type === "text") currentBlock.text += delta.text;
+          yield { type: "text", text: delta.text };
+        } else if (delta?.type === "thinking_delta" && delta.thinking) {
+          if (currentBlock?.type === "thinking") currentBlock.thinking += delta.thinking;
+          yield { type: "thinking", text: delta.thinking };
+        } else if (delta?.type === "signature_delta" && currentBlock?.type === "thinking") {
+          currentBlock.signature = delta.signature;
+        } else if (
+          delta?.type === "input_json_delta" &&
+          delta.partial_json &&
+          currentBlock
+        ) {
+          if (currentBlock.type === "tool_use") {
+            currentBlock.arguments += delta.partial_json;
+          }
+        }
+        break;
+      }
+      case "content_block_stop":
+        if (currentBlock?.type === "tool_use") {
+          let parsedArguments: Record<string, unknown> = {};
+          try {
+            parsedArguments = currentBlock.arguments ? JSON.parse(currentBlock.arguments) : {};
+          } catch { /* keep best-effort empty obj */ }
+          assistantBlocks.push({
+            type: "tool_use",
+            id: currentBlock.id ?? "_tool",
+            name: currentBlock.name ?? "unknown_tool",
+            input: parsedArguments,
+          });
+          yield {
+            type: "tool_call",
+            id: currentBlock.id ?? "_tool",
+            name: currentBlock.name ?? "unknown_tool",
+            arguments: currentBlock.arguments,
+          };
+        } else if (currentBlock?.type === "thinking") {
+          assistantBlocks.push({
+            type: "thinking",
+            thinking: currentBlock.thinking,
+            ...(currentBlock.signature ? { signature: currentBlock.signature } : {}),
+          });
+        } else if (currentBlock?.type === "redacted_thinking") {
+          assistantBlocks.push(currentBlock);
+        } else if (currentBlock?.type === "text" && currentBlock.text) {
+          assistantBlocks.push(currentBlock);
+        }
+        currentBlock = null;
+        break;
+      case "message_delta":
+        if (parsed.usage && typeof parsed.usage === "object") {
+          rawUsage = { ...(rawUsage ?? {}), ...(parsed.usage as Record<string, unknown>) };
+          if (typeof parsed.usage.output_tokens === "number") {
+            outputTokens = parsed.usage.output_tokens;
+          }
+        }
+        break;
+      case "message_stop": {
+        if (assistantBlocks.length > 0 || rawUsage) {
+          const anthropicData: AnthropicSidecar = {
+            contentBlocks: assistantBlocks,
+            ...(rawUsage ? { usage_raw: rawUsage } : {}),
+          };
+          yield {
+            type: "provider_sidecar",
+            providerSidecarData: { anthropic: anthropicData },
+          };
+        }
+        const nakedInput = typeof rawUsage?.input_tokens === "number" ? rawUsage.input_tokens : 0;
+        const cacheRead = typeof rawUsage?.cache_read_input_tokens === "number" ? rawUsage.cache_read_input_tokens : 0;
+        const cacheCreate = typeof rawUsage?.cache_creation_input_tokens === "number" ? rawUsage.cache_creation_input_tokens : 0;
+        yield { type: "usage", inputTokens: nakedInput + cacheRead + cacheCreate, outputTokens };
+        break;
+      }
+    }
+  }
 }
 
 function createAnthropicProvider(opts: ProviderFactoryOpts): LLMProvider {
@@ -532,161 +680,25 @@ function createAnthropicProvider(opts: ProviderFactoryOpts): LLMProvider {
         const text = await res.text();
         throwHttpApiError(res, text, "anthropic", model);
       }
-      const response = res;
 
-      let currentBlock:
-        | { type: "text"; text: string }
-        | { type: "thinking"; thinking: string; signature?: string }
-        | { type: "redacted_thinking"; data: string }
-        | { type: "tool_use"; id?: string; name?: string; arguments: string }
-        | null = null;
-      const assistantBlocks: AnthropicAssistantBlock[] = [];
-      let outputTokens = 0;
-      // Raw API usage object — merged from message_start (input/cache/service_tier) +
-      // message_delta (output_tokens). Stored as-is, no field enumeration.
-      let rawUsage: Record<string, unknown> | undefined;
-
-      for await (const { event, data } of parseSSE(response)) {
-        if (signal.aborted) break;
-
-        let parsed: any;
-        try {
-          parsed = JSON.parse(data);
-        } catch {
-          continue;
-        }
-
-        // HTTP-200 stream that carries an `event: error` chunk (e.g. overloaded_error)
-        // → throw (no-op otherwise) so the fallback chain can take over.
-        throwOnStreamError(parsed, "anthropic", model);
-
-        const eventType = event ?? parsed.type;
-
-        switch (eventType) {
-          case "message_start": {
-            if (parsed.message?.usage && typeof parsed.message.usage === "object") {
-              rawUsage = { ...(parsed.message.usage as Record<string, unknown>) };
-            }
-            break;
-          }
-
-          case "content_block_start": {
-            const block = parsed.content_block;
-            if (block?.type === "tool_use") {
-              currentBlock = {
-                type: "tool_use",
-                id: block.id,
-                name: block.name,
-                arguments: "",
-              };
-            } else if (block?.type === "thinking") {
-              currentBlock = {
-                type: "thinking",
-                thinking: typeof block.thinking === "string" ? block.thinking : "",
-                signature: typeof block.signature === "string" ? block.signature : undefined,
-              };
-            } else if (block?.type === "redacted_thinking") {
-              currentBlock = {
-                type: "redacted_thinking",
-                data: typeof block.data === "string" ? block.data : "",
-              };
-            } else {
-              currentBlock = {
-                type: "text",
-                text: typeof block?.text === "string" ? block.text : "",
-              };
-            }
-            break;
-          }
-
-          case "content_block_delta": {
-            const delta = parsed.delta;
-            if (delta?.type === "text_delta" && delta.text) {
-              if (currentBlock?.type === "text") currentBlock.text += delta.text;
-              yield { type: "text", text: delta.text };
-            } else if (delta?.type === "thinking_delta" && delta.thinking) {
-              if (currentBlock?.type === "thinking") currentBlock.thinking += delta.thinking;
-              yield { type: "thinking", text: delta.thinking };
-            } else if (delta?.type === "signature_delta" && currentBlock?.type === "thinking") {
-              currentBlock.signature = delta.signature;
-            } else if (
-              delta?.type === "input_json_delta" &&
-              delta.partial_json &&
-              currentBlock
-            ) {
-              if (currentBlock.type === "tool_use") {
-                currentBlock.arguments += delta.partial_json;
-              }
-            }
-            break;
-          }
-
-          case "content_block_stop":
-            if (currentBlock?.type === "tool_use") {
-              let parsedArguments: Record<string, unknown> = {};
-              try {
-                parsedArguments = currentBlock.arguments ? JSON.parse(currentBlock.arguments) : {};
-              } catch {}
-              assistantBlocks.push({
-                type: "tool_use",
-                id: currentBlock.id ?? "_tool",
-                name: currentBlock.name ?? "unknown_tool",
-                input: parsedArguments,
-              });
-              yield {
-                type: "tool_call",
-                id: currentBlock.id ?? "_tool",
-                name: currentBlock.name ?? "unknown_tool",
-                arguments: currentBlock.arguments,
-              };
-            } else if (currentBlock?.type === "thinking") {
-              assistantBlocks.push({
-                type: "thinking",
-                thinking: currentBlock.thinking,
-                ...(currentBlock.signature ? { signature: currentBlock.signature } : {}),
-              });
-            } else if (currentBlock?.type === "redacted_thinking") {
-              assistantBlocks.push(currentBlock);
-            } else if (currentBlock?.type === "text" && currentBlock.text) {
-              assistantBlocks.push(currentBlock);
-            }
-            currentBlock = null;
-            break;
-
-          case "message_delta":
-            // message_delta carries incremental usage updates (notably output_tokens during thinking).
-            if (parsed.usage && typeof parsed.usage === "object") {
-              rawUsage = { ...(rawUsage ?? {}), ...(parsed.usage as Record<string, unknown>) };
-              if (typeof parsed.usage.output_tokens === "number") {
-                outputTokens = parsed.usage.output_tokens;
-              }
-            }
-            break;
-
-          case "message_stop": {
-            if (assistantBlocks.length > 0 || rawUsage) {
-              const anthropicData: AnthropicSidecar = {
-                contentBlocks: assistantBlocks,
-                ...(rawUsage ? { usage_raw: rawUsage } : {}),
-              };
-              yield {
-                type: "provider_sidecar",
-                providerSidecarData: { anthropic: anthropicData },
-              };
-            }
-            // Outer aggregate: input includes cache_read + cache_create (framework convention).
-            const nakedInput = typeof rawUsage?.input_tokens === "number" ? rawUsage.input_tokens : 0;
-            const cacheRead = typeof rawUsage?.cache_read_input_tokens === "number" ? rawUsage.cache_read_input_tokens : 0;
-            const cacheCreate = typeof rawUsage?.cache_creation_input_tokens === "number" ? rawUsage.cache_creation_input_tokens : 0;
-            yield { type: "usage", inputTokens: nakedInput + cacheRead + cacheCreate, outputTokens };
-            break;
-          }
+      // Adapt parseSSE's `{event?, data: string}` shape to the parsed shape
+      // consumeAnthropicEvents wants. Malformed JSON chunks (rare; usually
+      // keep-alive heartbeats with empty data) are silently dropped, matching
+      // the previous inline behavior.
+      async function* parsedEvents() {
+        for await (const { event, data } of parseSSE(res)) {
+          let parsed: any;
+          try { parsed = JSON.parse(data); } catch { continue; }
+          yield { event, data: parsed };
         }
       }
+      yield* consumeAnthropicEvents(parsedEvents(), signal, "anthropic", model);
     },
   };
 }
 
-registerProvider("anthropic-messages", createAnthropicProvider);
+registerProvider("anthropic-messages", createAnthropicProvider, {
+  validateKey: requireApiKey,
+});
 
 export { createAnthropicProvider, contentToAnthropic, messagesToAnthropic };

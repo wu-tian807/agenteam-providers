@@ -29,23 +29,188 @@ export interface ProviderFactoryOpts {
    *  capture this in closure at construction time and never reach for a
    *  package-global state. See media-readers.ts for the interface contract. */
   readers: MediaReaders;
+  /** Optional escape hatch for adapters whose auth model does not fit
+   *  `apiKey + baseUrl` — e.g. AWS Bedrock needs `accessKeyId / secretAccessKey
+   *  / sessionToken / region`. The orchestrator stuffs whatever extra fields a
+   *  given `KeyEntry` carried into this bag and the factory casts to its own
+   *  shape. Other adapters ignore it. */
+  extras?: Record<string, unknown>;
 }
 
-interface KeyEntry {
-  api_key: string;
-  api: string;
+/**
+ * Provider key entries — type hints for `llm_key.json` sections.
+ *
+ * NOTE: This union is **not** the schema source of truth — runtime validation
+ * lives in `validateKeyEntry()` which dispatches to each adapter's own
+ * `validateKey` registered alongside its factory (see `registerProvider`).
+ *
+ * The union exists purely as a TypeScript-level convenience: discriminated
+ * narrowing lets test fixtures and config builders get autocomplete on the
+ * right fields. Adding a new provider is **not required** to extend this
+ * union — but doing so gives users typed config hints. New shapes can be
+ * appended freely; nothing in `provider.ts` switches on it.
+ */
+
+interface BaseKeyEntry {
+  /** Discriminant — selects the wire adapter. */
+  api: KnownApiType;
+  /** Model ids this section provides credentials for. */
   models: string[];
+}
+
+/**
+ * Adapters that authenticate with a single bearer-style API key. Most of them
+ * also support a custom endpoint via `api_base` (proxy / private deployment).
+ */
+interface ApiKeyAuthEntry extends BaseKeyEntry {
+  api:
+    | "anthropic-messages"
+    | "openai-completions"
+    | "openai-responses"
+    | "deepseek-v4"
+    | "claude-openai-compat";
+  api_key: string;
+  /** Override the upstream endpoint. Defaults vary per adapter (see each
+   *  factory's `baseUrl ?? "..."` fallback). */
   api_base?: string;
+}
+
+/**
+ * Gemini adapters (`@google/genai`) — bearer-style API key, but the SDK
+ * manages endpoints internally so `api_base` is intentionally not surfaced.
+ */
+interface GeminiKeyEntry extends BaseKeyEntry {
+  api: "google-gemini-2" | "google-gemini-3";
+  api_key: string;
+}
+
+/**
+ * AWS Bedrock — IAM static credentials, region-scoped. Endpoint is derived
+ * from `aws_region`; there is no `api_base`. Optional `aws_session_token`
+ * supports STS-issued temporary credentials (no auto-refresh — caller's job).
+ */
+interface BedrockKeyEntry extends BaseKeyEntry {
+  api: "aws-bedrock-anthropic";
+  aws_access_key_id: string;
+  aws_secret_access_key: string;
+  aws_region: string;
+  aws_session_token?: string;
+}
+
+/**
+ * Discriminated union of every supported key-section shape. TypeScript will
+ * narrow access to the correct field set once you've checked `entry.api`.
+ */
+export type KeyEntry = ApiKeyAuthEntry | GeminiKeyEntry | BedrockKeyEntry;
+
+/** Known `api` literal types for IDE autocomplete on hand-written configs.
+ *  Runtime accepts any string that has a registered factory; this union is
+ *  a hint, not a constraint. */
+export type KnownApiType = KeyEntry["api"];
+
+/**
+ * Validate a key-section entry's shape.
+ *
+ * Pure function — no I/O, returns a list of `{field, problem}` issues so
+ * callers can decide whether to throw, warn, or aggregate. Both the runtime
+ * provider construction path (`buildModelProvider`, hard error on issues)
+ * and the startup config script (`60-config.sh`, soft warnings) call this.
+ *
+ * Schema knowledge is split:
+ *   - **Base checks** (here): `api` is a non-empty string, `models` is a
+ *     non-empty array. Every section must satisfy these regardless of api.
+ *   - **Per-provider checks** (registry): each adapter calls
+ *     `registerProvider("foo", factory, { validateKey })` to declare what
+ *     fields IT needs. The validator runs after base checks pass.
+ *
+ * Adding a new provider → write the validator in your provider file, no
+ * changes here. Unknown `api` types yield a single "unknown api" issue.
+ */
+export function validateKeyEntry(
+  entry: unknown,
+): Array<{ field: string; problem: string }> {
+  const issues: Array<{ field: string; problem: string }> = [];
+  if (!entry || typeof entry !== "object") {
+    return [{ field: "<root>", problem: "section is not an object" }];
+  }
+  const e = entry as Record<string, unknown>;
+  if (!isNonEmptyString(e.api)) {
+    issues.push({ field: "api", problem: "missing or empty" });
+    return issues;
+  }
+  if (!Array.isArray(e.models) || e.models.length === 0) {
+    issues.push({ field: "models", problem: "must be a non-empty array of model ids" });
+  }
+
+  const reg = registry.get(e.api);
+  if (!reg) {
+    issues.push({
+      field: "api",
+      problem: `unknown api type '${e.api}' — no adapter registered for this value`,
+    });
+    return issues;
+  }
+  if (reg.validateKey) {
+    issues.push(...reg.validateKey(e));
+  }
+  return issues;
 }
 
 type ProviderFactory = (opts: ProviderFactoryOpts) => LLMProvider;
 
 // ── Adapter Registry (keyed by api type, e.g. "google-gemini-2") ──
 
-const registry = new Map<string, ProviderFactory>();
+/**
+ * Registry value bundles the factory with an optional schema validator.
+ * Each adapter owns its own credential schema — `provider.ts` itself doesn't
+ * know what fields any specific `api` type needs. Adding a new provider →
+ * new file calls `registerProvider("foo", factory, { validateKey })`; nothing
+ * in this file changes.
+ */
+interface RegistryEntry {
+  factory: ProviderFactory;
+  /** Returns issues; empty array = OK. Called by `validateKeyEntry()` after
+   *  base shape checks (api / models presence) have already passed. */
+  validateKey?: (entry: Record<string, unknown>) => Array<{ field: string; problem: string }>;
+  /** Map a key-entry to the `extras` bag the factory expects. Default
+   *  behavior (when omitted) is no extras — the adapter authenticates via
+   *  the standard `apiKey` / `baseUrl` channel only. Adapters whose auth
+   *  doesn't fit that mold (e.g. AWS Bedrock) override this. */
+  packExtras?: (entry: Record<string, unknown>) => Record<string, unknown> | undefined;
+}
 
-export function registerProvider(apiType: string, factory: ProviderFactory): void {
-  registry.set(apiType, factory);
+const registry = new Map<string, RegistryEntry>();
+
+export function registerProvider(
+  apiType: string,
+  factory: ProviderFactory,
+  opts?: {
+    validateKey?: RegistryEntry["validateKey"];
+    packExtras?: RegistryEntry["packExtras"];
+  },
+): void {
+  registry.set(apiType, {
+    factory,
+    validateKey: opts?.validateKey,
+    packExtras: opts?.packExtras,
+  });
+}
+
+/** Helper for adapters to write tight validators. Exported so each provider
+ *  file can use the same emptiness convention. */
+export function isNonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.trim() !== "";
+}
+
+/** Standard validator for adapters whose only required credential is a
+ *  non-empty `api_key`. Most providers (anthropic / openai-compat / gemini /
+ *  ...) just register with `{ validateKey: requireApiKey }`. */
+export function requireApiKey(
+  entry: Record<string, unknown>,
+): Array<{ field: string; problem: string }> {
+  return isNonEmptyString(entry.api_key)
+    ? []
+    : [{ field: "api_key", problem: "required (non-empty string)" }];
 }
 
 // ── model@keySection syntax ──────────────────────────────────────
@@ -322,29 +487,45 @@ function buildModelProvider(
   const { entry, sectionName } = deps.resolveKey(model, keySection);
 
   const apiType = entry.api;
-  const factory = registry.get(apiType);
-  if (!factory) {
+  const reg = registry.get(apiType);
+  if (!reg) {
     throw new Error(
       `No adapter registered for api type '${apiType}'. ` +
       `Available: ${[...registry.keys()].join(", ")}`,
     );
   }
+  const factory = reg.factory;
 
-  if (!entry.api_key) {
-    throw new Error(`Empty api_key in key section for model '${model}'`);
+  const issues = validateKeyEntry(entry);
+  if (issues.length) {
+    const detail = issues.map((i) => `${i.field}: ${i.problem}`).join("; ");
+    throw new Error(
+      `Invalid llm_key.json section '${sectionName}' (model '${model}'): ${detail}`,
+    );
   }
+
+  // Auth fields: `apiKey` + `baseUrl` are the common channel; adapters with
+  // exotic auth (AWS Bedrock IAM, etc.) opt into `packExtras` to surface
+  // their own credential bag. The conditional read of `api_key` / `api_base`
+  // is kept here only because they're cross-cutting standard names —
+  // anything else lives in `extras`.
+  const e = entry as unknown as Record<string, unknown>;
+  const apiKey = typeof e.api_key === "string" ? e.api_key : "";
+  const baseUrl = typeof e.api_base === "string" ? e.api_base : undefined;
+  const extras = reg.packExtras ? reg.packExtras(e) : undefined;
 
   const resolvedSpec = deps.getModelSpec(model);
   const params = resolveModelParams(model, modelsConfig, resolvedSpec);
   const provider = factory({
     model,
-    apiKey: entry.api_key,
-    baseUrl: entry.api_base,
+    apiKey,
+    baseUrl,
     temperature: params.temperature,
     maxTokens: params.maxTokens,
     reasoningEffort: params.reasoningEffort,
     fast: modelsConfig.fast,
     readers: deps.readers,
+    extras,
   });
   return {
     ...provider,
