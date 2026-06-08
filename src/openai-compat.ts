@@ -8,7 +8,6 @@ import { listSupported } from "./types.js";
 import { parseSSE } from "./stream.js";
 import { annotateLLMError, throwHttpApiError, throwOnStreamError } from "./errors.js";
 import type { MediaReaders } from "./media-readers.js";
-import { base64EncodedSize } from "./image-compression.js";
 import { blocksToText } from "./types.js";
 import { foldDynamicReminders } from "./dynamic-system.js";
 
@@ -42,13 +41,11 @@ const OPENAI_SUPPORTED_FILE_MIME_TYPES = new Set([
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
   "application/vnd.ms-excel",
 ]);
-const OPENAI_REQUEST_MAX_BYTES = 50 * 1024 * 1024; // per-request combined file size limit (text messages excluded)
-
-class RequestBudget {
-  private used = 0;
-  charge(bytes: number): void { this.used += bytes; }
-  canFit(bytes: number): boolean { return this.used + bytes <= OPENAI_REQUEST_MAX_BYTES; }
-}
+// Per-provider request size policing (the previous 50 MB `RequestBudget`)
+// has been removed: providers are pure ContentPart → wire translators and
+// must not silently rewrite payloads. Any size budgeting / preview /
+// truncation belongs above the provider boundary so the caller can see
+// and control what the model and the ledger are looking at.
 
 export function toolDefsToOpenAI(tools?: ToolSchema[]) {
   if (!tools?.length) return undefined;
@@ -62,17 +59,17 @@ export function toolDefsToOpenAI(tools?: ToolSchema[]) {
   }));
 }
 
-export async function contentToOpenAI(content: ContentPart[], readers: MediaReaders, budget?: RequestBudget): Promise<any[]> {
+export async function contentToOpenAI(content: ContentPart[], readers: MediaReaders): Promise<any[]> {
   const result: any[] = [];
   for (const p of content) {
-    const converted = await convertPartToOpenAI(p, readers, budget);
+    const converted = await convertPartToOpenAI(p, readers);
     if (Array.isArray(converted)) { result.push(...converted); }
     else { result.push(converted); }
   }
   return result;
 }
 
-async function convertPartToOpenAI(p: ContentPart, readers: MediaReaders, budget?: RequestBudget): Promise<any> {
+async function convertPartToOpenAI(p: ContentPart, readers: MediaReaders): Promise<any> {
   if (p.type === "text") {
     return { type: "text", text: p.text };
   }
@@ -94,13 +91,7 @@ async function convertPartToOpenAI(p: ContentPart, readers: MediaReaders, budget
     // of whether it sits behind a translating proxy.
     try {
       const { bytes } = await readers.readFileBytes(p);
-      const text = bytes.toString("utf8");
-      const utf8Size = Buffer.byteLength(text, "utf8");
-      if (budget && !budget.canFit(utf8Size)) {
-        return { type: "text", text: `[file omitted: request size would exceed 50 MB limit (${p.path})]` };
-      }
-      budget?.charge(utf8Size);
-      return { type: "text", text: `[file: ${p.path}]\n${text}` };
+      return { type: "text", text: `[file: ${p.path}]\n${bytes.toString("utf8")}` };
     } catch {
       return { type: "text", text: `[file unavailable: ${p.path}]` };
     }
@@ -118,11 +109,6 @@ async function convertPartToOpenAI(p: ContentPart, readers: MediaReaders, budget
     if (!OPENAI_SUPPORTED_FILE_MIME_TYPES.has(mimeType)) {
       return { type: "text", text: `[file unsupported by OpenAI: ${p.path} (${mimeType})]` };
     }
-    const b64Size = base64EncodedSize(bytes);
-    if (budget && !budget.canFit(b64Size)) {
-      return { type: "text", text: `[file omitted: request size would exceed 50 MB limit (${p.path})]` };
-    }
-    budget?.charge(b64Size);
     return {
       type: "file",
       file: {
@@ -141,11 +127,6 @@ async function convertPartToOpenAI(p: ContentPart, readers: MediaReaders, budget
           text: `[image: unsupported by OpenAI for mime ${loaded.mimeType}. Supported: ${listSupported(OPENAI_SUPPORTED_IMAGE_MIME_TYPES)}]`,
         };
       }
-      const b64Size = base64EncodedSize(loaded.bytes);
-      if (budget && !budget.canFit(b64Size)) {
-        return { type: "text", text: `[image omitted: request size would exceed 50 MB limit (${p.path})]` };
-      }
-      budget?.charge(b64Size);
       return [
         { type: "text", text: `[file: ${p.path}]` },
         { type: "image_url", image_url: { url: `data:${loaded.mimeType};base64,${loaded.bytes.toString("base64")}` } },
@@ -164,11 +145,6 @@ async function convertPartToOpenAI(p: ContentPart, readers: MediaReaders, budget
           text: `[audio: unsupported by OpenAI for mime ${loaded.mimeType}. Supported: ${listSupported(Object.keys(OPENAI_AUDIO_FORMAT_BY_MIME))}]`,
         };
       }
-      const b64Size = base64EncodedSize(loaded.bytes);
-      if (budget && !budget.canFit(b64Size)) {
-        return { type: "text", text: `[audio omitted: request size would exceed 50 MB limit (${p.path})]` };
-      }
-      budget?.charge(b64Size);
       return [
         { type: "text", text: `[file: ${p.path}]` },
         { type: "input_audio", input_audio: { data: loaded.bytes.toString("base64"), format: OPENAI_AUDIO_FORMAT_BY_MIME[loaded.mimeType] } },
@@ -199,11 +175,6 @@ async function convertPartToOpenAI(p: ContentPart, readers: MediaReaders, budget
             `Supported image MIME types: ${listSupported(OPENAI_SUPPORTED_IMAGE_MIME_TYPES)}]`,
         };
       }
-      const b64Size = base64EncodedSize(bytes);
-      if (budget && !budget.canFit(b64Size)) {
-        return { type: "text", text: `[image omitted: request size would exceed 50 MB limit]` };
-      }
-      budget?.charge(b64Size);
       return {
         type: "image_url",
         image_url: { url: `data:${sniffedMime};base64,${bytes.toString("base64")}` },
@@ -221,11 +192,6 @@ async function convertPartToOpenAI(p: ContentPart, readers: MediaReaders, budget
             `Supported audio MIME types: ${listSupported(Object.keys(OPENAI_AUDIO_FORMAT_BY_MIME))}]`,
         };
       }
-      const b64Size = base64EncodedSize(bytes);
-      if (budget && !budget.canFit(b64Size)) {
-        return { type: "text", text: `[audio omitted: request size would exceed 50 MB limit]` };
-      }
-      budget?.charge(b64Size);
       return {
         type: "input_audio",
         input_audio: {
@@ -272,7 +238,6 @@ async function appendToolMediaUserMessage(
   result: any[],
   toolMessages: LLMMessage[],
   readers: MediaReaders,
-  budget: RequestBudget,
 ): Promise<void> {
   const content: any[] = [];
   for (const msg of toolMessages) {
@@ -283,7 +248,7 @@ async function appendToolMediaUserMessage(
       type: "text",
       text: `Media returned by ${msg.toolName ?? "tool"} (${msg.toolCallId ?? "unknown"}):`,
     });
-    content.push(...await contentToOpenAI(attachments, readers, budget));
+    content.push(...await contentToOpenAI(attachments, readers));
   }
 
   if (content.length > 0) {
@@ -298,12 +263,9 @@ export async function messagesToOpenAI(
   assistantTransform?: OpenAIAssistantTransform,
 ): Promise<any[]> {
   const result: any[] = [];
-  const budget = new RequestBudget();
 
   if (system?.length) {
-    const sysText = blocksToText(system);
-    budget.charge(Buffer.byteLength(sysText, "utf8"));
-    result.push({ role: "system", content: sysText });
+    result.push({ role: "system", content: blocksToText(system) });
   }
 
   for (let i = 0; i < messages.length; i++) {
@@ -313,25 +275,23 @@ export async function messagesToOpenAI(
       while (i < messages.length && messages[i].role === "tool") {
         const toolMsg = messages[i];
         if (toolMsg.toolStatus !== "pending") {
-          const toolText = toolResultText(toolMsg);
-          budget.charge(Buffer.byteLength(toolText, "utf8"));
           result.push({
             role: "tool",
             tool_call_id: toolMsg.toolCallId ?? "_tool",
-            content: toolText,
+            content: toolResultText(toolMsg),
           });
           toolMessages.push(toolMsg);
         }
         i++;
       }
-      await appendToolMediaUserMessage(result, toolMessages, readers, budget);
+      await appendToolMediaUserMessage(result, toolMessages, readers);
       i--;
       continue;
     }
 
     if (msg.role === "assistant" && msg.toolCalls?.length) {
       const assistantMsg: Record<string, unknown> = { role: "assistant" };
-      if (msg.content) assistantMsg.content = await contentToOpenAI(msg.content, readers, budget);
+      if (msg.content) assistantMsg.content = await contentToOpenAI(msg.content, readers);
       assistantMsg.tool_calls = msg.toolCalls.map((tc) => ({
         id: tc.id,
         type: "function",
@@ -347,7 +307,7 @@ export async function messagesToOpenAI(
 
     const generic: Record<string, unknown> = {
       role: msg.role,
-      content: await contentToOpenAI(msg.content, readers, budget),
+      content: await contentToOpenAI(msg.content, readers),
     };
     if (msg.role === "assistant") assistantTransform?.(generic, msg);
     result.push(generic);
