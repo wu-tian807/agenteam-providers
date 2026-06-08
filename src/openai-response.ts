@@ -9,7 +9,6 @@ import { parseSSE } from "./stream.js";
 import { annotateLLMError, throwHttpApiError } from "./errors.js";
 import { normalizeBaseUrl } from "./openai-compat.js";
 import type { MediaReaders } from "./media-readers.js";
-import { base64EncodedSize } from "./image-compression.js";
 import { blocksToText } from "./types.js";
 import { reconstructDynamicBlocks } from "./dynamic-system.js";
 
@@ -88,39 +87,40 @@ const OPENAI_SUPPORTED_FILE_MIME_TYPES = new Set([
   "application/vnd.ms-excel",
 ]);
 
-const OPENAI_REQUEST_MAX_BYTES = 50 * 1024 * 1024;
-
-class RequestBudget {
-  private used = 0;
-  charge(bytes: number): void { this.used += bytes; }
-  canFit(bytes: number): boolean { return this.used + bytes <= OPENAI_REQUEST_MAX_BYTES; }
-}
-
 // ── ContentPart → Responses content shapes ──
 //
 // Two flavors of ContentPart conversion: `input_*` (used in user messages
 // and tool result content lists) vs `output_text` (used when replaying an
 // assistant message back to the API). Same source ContentPart, different
 // type tags depending on which slot it occupies.
+//
+// `text_file` is always inlined as `input_text` (path label + UTF-8 body),
+// never routed through the `input_file` base64 channel. Mirrors the
+// `openai-compat.ts` / `anthropic.ts` text_file decision: OpenAI's
+// `input_file` mime gate (PDF + Office) does not accept text/* anyway, and
+// when the request is forwarded through a LiteLLM-style proxy to a
+// Bedrock-Anthropic backend the proxy translates `input_file` 1:1 into
+// `document.source.base64.media_type` which Bedrock rejects for anything
+// other than application/pdf. Inlining costs no base64 inflation
+// (~33% savings) and works uniformly across every backend regardless of
+// proxy routing. Native `input_file` is reserved for the supported binary
+// document mimes (PDF + Office, see `file` branch below).
+//
+// Per-provider request size policing (the previous 50 MB `RequestBudget`)
+// has been removed from this layer: providers are pure ContentPart → wire
+// translators and must not silently rewrite payloads. Any size budgeting /
+// preview / truncation belongs above the provider boundary so the caller
+// can see and control what the model and the ledger are looking at.
 
-async function convertPartToInputContent(p: ContentPart, readers: MediaReaders, budget?: RequestBudget): Promise<any> {
+async function convertPartToInputContent(p: ContentPart, readers: MediaReaders): Promise<any> {
   if (p.type === "text") {
     return { type: "input_text", text: p.text };
   }
 
   if (p.type === "text_file") {
     try {
-      const { bytes, mimeType } = await readers.readFileBytes(p);
-      const b64Size = base64EncodedSize(bytes);
-      if (budget && !budget.canFit(b64Size)) {
-        return { type: "input_text", text: `[file omitted: request size would exceed 50 MB limit (${p.path})]` };
-      }
-      budget?.charge(b64Size);
-      return {
-        type: "input_file",
-        filename: p.path,
-        file_data: `data:${mimeType};base64,${bytes.toString("base64")}`,
-      };
+      const { bytes } = await readers.readFileBytes(p);
+      return { type: "input_text", text: `[file: ${p.path}]\n${bytes.toString("utf8")}` };
     } catch {
       return { type: "input_text", text: `[file unavailable: ${p.path}]` };
     }
@@ -138,11 +138,6 @@ async function convertPartToInputContent(p: ContentPart, readers: MediaReaders, 
     if (!OPENAI_SUPPORTED_FILE_MIME_TYPES.has(mimeType)) {
       return { type: "input_text", text: `[file unsupported by OpenAI: ${p.path} (${mimeType})]` };
     }
-    const b64Size = base64EncodedSize(bytes);
-    if (budget && !budget.canFit(b64Size)) {
-      return { type: "input_text", text: `[file omitted: request size would exceed 50 MB limit (${p.path})]` };
-    }
-    budget?.charge(b64Size);
     return {
       type: "input_file",
       filename: p.path,
@@ -159,11 +154,6 @@ async function convertPartToInputContent(p: ContentPart, readers: MediaReaders, 
           text: `[image: unsupported by OpenAI for mime ${loaded.mimeType}. Supported: ${listSupported(OPENAI_SUPPORTED_IMAGE_MIME_TYPES)}]`,
         };
       }
-      const b64Size = base64EncodedSize(loaded.bytes);
-      if (budget && !budget.canFit(b64Size)) {
-        return { type: "input_text", text: `[image omitted: request size would exceed 50 MB limit (${p.path})]` };
-      }
-      budget?.charge(b64Size);
       return [
         { type: "input_text", text: `[file: ${p.path}]` },
         { type: "input_image", image_url: `data:${loaded.mimeType};base64,${loaded.bytes.toString("base64")}` },
@@ -199,11 +189,6 @@ async function convertPartToInputContent(p: ContentPart, readers: MediaReaders, 
             `Supported image MIME types: ${listSupported(OPENAI_SUPPORTED_IMAGE_MIME_TYPES)}]`,
         };
       }
-      const b64Size = base64EncodedSize(bytes);
-      if (budget && !budget.canFit(b64Size)) {
-        return { type: "input_text", text: `[image omitted: request size would exceed 50 MB limit]` };
-      }
-      budget?.charge(b64Size);
       return {
         type: "input_image",
         image_url: `data:${sniffedMime};base64,${bytes.toString("base64")}`,
@@ -216,10 +201,10 @@ async function convertPartToInputContent(p: ContentPart, readers: MediaReaders, 
   }
 }
 
-async function inputContentList(parts: ContentPart[], readers: MediaReaders, budget?: RequestBudget): Promise<any[]> {
+async function inputContentList(parts: ContentPart[], readers: MediaReaders): Promise<any[]> {
   const result: any[] = [];
   for (const p of parts) {
-    const converted = await convertPartToInputContent(p, readers, budget);
+    const converted = await convertPartToInputContent(p, readers);
     if (Array.isArray(converted)) { result.push(...converted); }
     else { result.push(converted); }
   }
@@ -257,7 +242,6 @@ function toolDefsToResponses(tools?: ToolSchema[]) {
  *  items are intentionally omitted (see file-level note + probe C). */
 export async function messagesToResponseInput(messages: LLMMessage[], readers: MediaReaders): Promise<any[]> {
   const result: any[] = [];
-  const budget = new RequestBudget();
 
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i];
@@ -274,7 +258,7 @@ export async function messagesToResponseInput(messages: LLMMessage[], readers: M
           const hasNonText = tm.content.some((p) => p.type !== "text");
           if (hasNonText) {
             // Native multimodal: emit content list (verified probe B).
-            const contentList = await inputContentList(tm.content, readers, budget);
+            const contentList = await inputContentList(tm.content, readers);
             result.push({
               type: "function_call_output",
               call_id: tm.toolCallId ?? "_tool",
@@ -286,7 +270,6 @@ export async function messagesToResponseInput(messages: LLMMessage[], readers: M
               .filter((p) => p.type === "text")
               .map((p) => (p as Extract<ContentPart, { type: "text" }>).text)
               .join("");
-            budget.charge(Buffer.byteLength(text, "utf8"));
             result.push({
               type: "function_call_output",
               call_id: tm.toolCallId ?? "_tool",
@@ -326,7 +309,7 @@ export async function messagesToResponseInput(messages: LLMMessage[], readers: M
     // user message
     result.push({
       role: "user",
-      content: await inputContentList(msg.content, readers, budget),
+      content: await inputContentList(msg.content, readers),
     });
   }
   return result;
