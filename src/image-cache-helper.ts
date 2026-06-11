@@ -25,8 +25,17 @@ function extOf(mime: string): string {
 /**
  * Replace each oversized image / image_file part with a cache-resolved
  * compressed variant. Pure shape — wire format conversion still happens
- * inside the provider's `convertPartTo*`. Output part types are preserved
- * (inline → inline; path-based → path-based with cached path).
+ * inside the provider's `convertPartTo*`.
+ *
+ * Output shape (preserves the legacy wire-format display):
+ *   - inline `image` part oversized → single inline image with compressed bytes.
+ *   - `image_file` part oversized → TWO parts in sequence:
+ *       [{type:"text", text:"[file: ${origPath}]"}, {type:"image", data:<compressed-base64>, mimeType}]
+ *     This mirrors the legacy `convertPartToAnthropic` image_file handling
+ *     which emitted `[file: <origPath>]` + image; keeping the text label
+ *     anchored to the ORIGINAL path (not the cache file path) preserves
+ *     the LLM-visible context exactly. Cache writes still happen so the
+ *     next buildPrompt skips the compression step.
  *
  * Behaviour matrix:
  *   - Part within `policy` limits → unchanged (no read, no cache hit, no
@@ -73,11 +82,12 @@ export async function applyImageCache(
         policyHash,
         providerName,
       );
-      if (replaced && replaced !== part) {
-        msgTouched = true;
-        parts.push(replaced);
+      if (replaced === null) {
+        parts.push(part); // not oversized / unreadable / cannot fit — keep original
       } else {
-        parts.push(part);
+        msgTouched = true;
+        if (Array.isArray(replaced)) parts.push(...replaced);
+        else parts.push(replaced);
       }
     }
     if (!msgTouched) return msg;
@@ -94,7 +104,7 @@ async function maybeReplace(
   policy: ImagePreflightPolicy,
   policyHash: string,
   providerName: string,
-): Promise<ContentPart | null> {
+): Promise<ContentPart | ContentPart[] | null> {
   const srcKey = computeSourceKey(part);
 
   // Read bytes — for image_file via host reader, for inline via base64
@@ -133,7 +143,7 @@ async function maybeReplace(
           ext: candidateExt,
         });
         if (hit) {
-          return rewritePart(part, hit.bytes, extToMime(candidateExt), hit.path);
+          return rewritePart(part, hit.bytes, extToMime(candidateExt));
         }
       } catch { /* swallow — treat as miss */ }
     }
@@ -144,41 +154,44 @@ async function maybeReplace(
   const fit = await fitImageToPolicy(bytes, mimeType, policy);
   if (!fit || exceedsImageLimit(fit.bytes, policy)) return null;
 
-  const ext = extOf(fit.mimeType);
-  let cachedPath: string | undefined;
   if (shapeCache) {
     try {
-      const w = await shapeCache.writeImage({
+      await shapeCache.writeImage({
         providerName,
         srcKey,
         policyHash,
-        ext,
+        ext: extOf(fit.mimeType),
         bytes: fit.bytes,
       });
-      cachedPath = w.path;
-    } catch { /* cache write failure is non-fatal */ }
+    } catch { /* cache write failure is non-fatal — next turn will recompress */ }
   }
 
-  return rewritePart(part, fit.bytes, fit.mimeType, cachedPath);
+  return rewritePart(part, fit.bytes, fit.mimeType);
 }
 
+/**
+ * Build the shape output for an oversized image part.
+ *
+ *   - `image` (inline) → single inline image with compressed bytes.
+ *   - `image_file` (path-based) → [text label with original path, inline image]
+ *     two-part sequence; preserves the LLM-visible `[file: <origPath>]`
+ *     prefix the legacy wire-format converter (`convertPartToAnthropic`)
+ *     emitted, while folding the compressed bytes inline so the wire
+ *     converter does NOT re-read the path (otherwise it would still load
+ *     the oversized original through `readers.readMediaBytes`).
+ */
 function rewritePart(
   part: Extract<ContentPart, { type: "image" | "image_file" }>,
   bytes: Buffer,
   mimeType: string,
-  cachedPath?: string,
-): ContentPart {
+): ContentPart | ContentPart[] {
   if (part.type === "image") {
     return { type: "image", data: bytes.toString("base64"), mimeType };
   }
-  // image_file — keep type but swap path to cached file when available.
-  if (cachedPath) {
-    return { ...part, path: cachedPath, mimeType };
-  }
-  // No cache, but compression succeeded — degrade to inline image so
-  // downstream uses the compressed bytes (otherwise the path still
-  // points at the oversized original).
-  return { type: "image", data: bytes.toString("base64"), mimeType };
+  return [
+    { type: "text", text: `[file: ${part.path}]` },
+    { type: "image", data: bytes.toString("base64"), mimeType },
+  ];
 }
 
 function candidateOutputExts(inputMime: string): string[] {
