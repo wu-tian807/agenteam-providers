@@ -9,9 +9,10 @@ import {
   toolDefsToGemini,
   contentPartsToGemini,
   describeGeminiError,
-  prepareGeminiInboundMessages,
+  shapeGeminiMessages,
   yieldGeminiUsage,
 } from "./gemini-shared.js";
+import type { GeminiFileRefMap } from "./files-api-helper.js";
 import type { MediaReaders } from "./media-readers.js";
 import { extractTextContent } from "@agenteam/types";
 import { blocksToText } from "./types.js";
@@ -177,7 +178,11 @@ async function* streamGemini3Response(
   }
 }
 
-async function messagesToGemini3(messages: LLMMessage[], readers: MediaReaders): Promise<any[]> {
+async function messagesToGemini3(
+  messages: LLMMessage[],
+  readers: MediaReaders,
+  fileRefMap?: GeminiFileRefMap,
+): Promise<any[]> {
   const contents: any[] = [];
   let textFallbackForNextToolTurn = false;
 
@@ -245,7 +250,7 @@ async function messagesToGemini3(messages: LLMMessage[], readers: MediaReaders):
 
     contents.push({
       role: "user",
-      parts: await contentPartsToGemini(msg.content, readers, msg),
+      parts: await contentPartsToGemini(msg.content, readers, fileRefMap),
     });
   }
   return contents;
@@ -258,17 +263,26 @@ function createGemini3Provider(opts: ProviderFactoryOpts): LLMProvider {
   const maxOutputTokens = opts.maxTokens;
   const reasoningEffort = opts.reasoningEffort;
   const readers = opts.readers;
+  // Closure-scoped Files API ref map — see gemini2.ts for rationale.
+  const fileRefMap: GeminiFileRefMap = new Map();
 
   return {
-    async prepareInboundMessages(messages, context) {
-      return await prepareGeminiInboundMessages(client, messages, readers, context.signal);
+    async shapeMessages(messages, context) {
+      return await shapeGeminiMessages(
+        client,
+        messages,
+        readers,
+        opts.shapeCache,
+        fileRefMap,
+        context,
+      );
     },
     async *chatStream(system, messages, tools, signal) {
       try {
         // `system` is stable-only → systemInstruction. Dynamic role:"system"
         // carriers are folded (two-layer smoosh) into their preceding immutable
         // turn; same cache rationale as gemini2.ts.
-        const contents = await messagesToGemini3(foldDynamicReminders(messages), readers);
+        const contents = await messagesToGemini3(foldDynamicReminders(messages), readers, fileRefMap);
         const geminiTools = toolDefsToGemini(tools);
 
         const config: any = {

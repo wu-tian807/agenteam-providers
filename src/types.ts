@@ -56,8 +56,44 @@ export type StreamEvent =
   | { type: "provider_sidecar"; providerSidecarData: ProviderSidecarData }
   | { type: "usage"; inputTokens: number; outputTokens: number; model?: string };
 
-export interface PrepareInboundMessagesContext {
+export interface ShapeMessagesContext {
   signal: AbortSignal;
+}
+
+/** Cache operator the host (src/) injects via ProviderDeps.shapeCache.
+ *  Provider helpers (image compression, Gemini Files API) call into this
+ *  to persist derived artefacts under {sessionDir}/medias/cache/...
+ *  When `shapeCache` is undefined the helpers degrade to in-memory only. */
+export interface CachedFilesApiEntry {
+  uri: string;
+  mimeType: string;
+  name?: string;
+  /** Absolute timestamp (ms). lookupFilesApi must reject entries
+   *  within a 1h safety margin of this value. */
+  expiresAt: number;
+}
+
+export interface ShapeCache {
+  /** Look up a cached compressed image (provider+srcKey+policyHash+ext). */
+  lookupImage(opts: {
+    providerName: string;
+    srcKey: string;
+    policyHash: string;
+    ext: string;
+  }): Promise<{ bytes: Buffer; path: string } | null>;
+  writeImage(opts: {
+    providerName: string;
+    srcKey: string;
+    policyHash: string;
+    ext: string;
+    bytes: Buffer;
+  }): Promise<{ path: string }>;
+  /** Look up a still-fresh Gemini Files API URI by srcKey. Returns null on miss/expiry. */
+  lookupFilesApi(opts: { srcKey: string }): Promise<CachedFilesApiEntry | null>;
+  writeFilesApi(opts: {
+    srcKey: string;
+    entry: CachedFilesApiEntry;
+  }): Promise<void>;
 }
 
 export interface MaterializeAssistantMessageOptions {
@@ -78,12 +114,15 @@ export interface LLMProvider {
     signal: AbortSignal,
   ): AsyncIterable<StreamEvent>;
 
-  /** Provider-specific pre-processing hook.
-   * Use this for adapter-specific enrichment (e.g. Gemini file refs), not as the generic
-   * string -> ContentPart[] normalization entrypoint. */
-  prepareInboundMessages?(
+  /** Per-buildPrompt message integrity / shaping hook. Runs in the
+   *  context-window pipeline AFTER WAL is materialised — output flows
+   *  into ledger.json + wire only, never back to events.jsonl.
+   *  Each provider composes its own helper chain (e.g. Anthropic does
+   *  inlineTextFiles → applyImageCache; Gemini does inlineTextFiles →
+   *  applyGeminiFilesApi). */
+  shapeMessages?(
     messages: LLMMessage[],
-    context: PrepareInboundMessagesContext,
+    context: ShapeMessagesContext,
   ): Promise<LLMMessage[]>;
 
   materializeAssistantMessage?(

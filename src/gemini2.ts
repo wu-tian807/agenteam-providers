@@ -9,15 +9,20 @@ import {
   toolDefsToGemini,
   contentPartsToGemini,
   describeGeminiError,
-  prepareGeminiInboundMessages,
+  shapeGeminiMessages,
   streamGeminiResponse,
 } from "./gemini-shared.js";
+import type { GeminiFileRefMap } from "./files-api-helper.js";
 import type { MediaReaders } from "./media-readers.js";
 import { extractTextContent } from "@agenteam/types";
 import { blocksToText } from "./types.js";
 import { foldDynamicReminders } from "./dynamic-system.js";
 
-export async function messagesToGemini2(messages: LLMMessage[], readers: MediaReaders): Promise<any[]> {
+export async function messagesToGemini2(
+  messages: LLMMessage[],
+  readers: MediaReaders,
+  fileRefMap?: GeminiFileRefMap,
+): Promise<any[]> {
   const contents: any[] = [];
 
   for (let i = 0; i < messages.length; i++) {
@@ -57,7 +62,7 @@ export async function messagesToGemini2(messages: LLMMessage[], readers: MediaRe
 
     contents.push({
       role: "user",
-      parts: await contentPartsToGemini(msg.content, readers, msg),
+      parts: await contentPartsToGemini(msg.content, readers, fileRefMap),
     });
   }
   return contents;
@@ -70,10 +75,21 @@ function createGemini2Provider(opts: ProviderFactoryOpts): LLMProvider {
   const maxOutputTokens = opts.maxTokens;
   const reasoningEffort = opts.reasoningEffort;
   const readers = opts.readers;
+  // Closure-scoped: maps part srcKey → already-uploaded Files API ref.
+  // Survives the lifetime of this provider instance (one-shot fallback
+  // chain link); shape pipeline populates, contentPartsToGemini consumes.
+  const fileRefMap: GeminiFileRefMap = new Map();
 
   return {
-    async prepareInboundMessages(messages, context) {
-      return await prepareGeminiInboundMessages(client, messages, readers, context.signal);
+    async shapeMessages(messages, context) {
+      return await shapeGeminiMessages(
+        client,
+        messages,
+        readers,
+        opts.shapeCache,
+        fileRefMap,
+        context,
+      );
     },
     async *chatStream(system, messages, tools, signal) {
       try {
@@ -82,7 +98,7 @@ function createGemini2Provider(opts: ProviderFactoryOpts): LLMProvider {
         // smoosh folds each into its preceding (immutable) user / tool_result
         // turn so Gemini implicit context caching keeps systemInstruction + the
         // full byte-stable history cache-eligible.
-        const contents = await messagesToGemini2(foldDynamicReminders(messages), readers);
+        const contents = await messagesToGemini2(foldDynamicReminders(messages), readers, fileRefMap);
         const geminiTools = toolDefsToGemini(tools);
 
         const config: any = {

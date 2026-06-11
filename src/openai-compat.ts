@@ -10,6 +10,7 @@ import { annotateLLMError, throwHttpApiError, throwOnStreamError } from "./error
 import type { MediaReaders } from "./media-readers.js";
 import { blocksToText } from "./types.js";
 import { foldDynamicReminders } from "./dynamic-system.js";
+import { inlineTextFiles } from "./inline-text-files.js";
 
 // OpenAI image input keeps the original MIME in a data URL, while audio input
 // uses a provider-specific `format` enum. We still model both as explicit
@@ -75,26 +76,13 @@ async function convertPartToOpenAI(p: ContentPart, readers: MediaReaders): Promi
   }
 
   if (p.type === "text_file") {
-    // OpenAI's chat completions `file` content part is gated on
-    // OPENAI_SUPPORTED_FILE_MIME_TYPES (PDF + Office formats) — it does NOT
-    // accept text/plain, text/markdown or any other text/* mime. Sending
-    // those as `{type:"file", file_data:"data:text/markdown;..."}` is also
-    // poisonous when the request is forwarded to an Anthropic backend
-    // through a LiteLLM-style proxy: the proxy translates `file` → Anthropic
-    // `document.source.base64.media_type` 1:1 and Bedrock-Anthropic rejects
-    // anything other than application/pdf there.
-    //
-    // Mirror `anthropic.ts:convertPartToAnthropic` for text_file: read the
-    // bytes, decode as UTF-8, and inline as a text block. This keeps the
-    // model's ability to read the file content, costs no base64 inflation
-    // (~33% savings vs. base64), and is safe for every backend regardless
-    // of whether it sits behind a translating proxy.
-    try {
-      const { bytes } = await readers.readFileBytes(p);
-      return { type: "text", text: `[file: ${p.path}]\n${bytes.toString("utf8")}` };
-    } catch {
-      return { type: "text", text: `[file unavailable: ${p.path}]` };
-    }
+    // Pipeline invariant: text_file must have been inlined upstream by the
+    // shape pipeline's `inlineTextFiles` helper. Reaching this point means
+    // shape did not run — throw to surface the misconfiguration.
+    throw new Error(
+      `[openai-compat convertPartToOpenAI] received text_file part — shape ` +
+      `pipeline did not run inlineTextFiles. Path: ${p.path}`,
+    );
   }
 
   if (p.type === "file") {
@@ -567,8 +555,8 @@ export function normalizeBaseUrl(url: string): string {
 
 function createOpenAICompatProvider(opts: ProviderFactoryOpts): LLMProvider {
   return {
-    async prepareInboundMessages(messages, _context) {
-      return messages;
+    async shapeMessages(messages, _context) {
+      return await inlineTextFiles(messages, opts.readers);
     },
     async *chatStream(system, messages, tools, signal) {
       yield* openAICompatStream(

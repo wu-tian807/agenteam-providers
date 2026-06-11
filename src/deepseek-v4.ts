@@ -7,6 +7,7 @@ import {
   normalizeBaseUrl,
   type OpenAIAssistantTransform,
 } from "./openai-compat.js";
+import { inlineTextFiles } from "./inline-text-files.js";
 
 /**
  * DeepSeek V4 thinking-mode control.
@@ -45,6 +46,9 @@ function createDeepSeekV4Provider(opts: ProviderFactoryOpts): LLMProvider {
   };
 
   return {
+    async shapeMessages(messages, _context) {
+      return await inlineTextFiles(messages, opts.readers);
+    },
     async *chatStream(system, messages, tools, signal) {
       yield* openAICompatStream(
         {

@@ -84,6 +84,7 @@ import {
   type OpenAIAssistantTransform,
 } from "./openai-compat.js";
 import { foldDynamicReminders } from "./dynamic-system.js";
+import { inlineTextFiles } from "./inline-text-files.js";
 
 // ── Sidecar ──────────────────────────────────────────────────────
 
@@ -292,8 +293,8 @@ function createClaudeOpenAICompatProvider(opts: ProviderFactoryOpts): LLMProvide
   };
 
   return {
-    async prepareInboundMessages(messages, _context) {
-      return messages;
+    async shapeMessages(messages, _context) {
+      return await inlineTextFiles(messages, readers);
     },
 
     async *chatStream(system, messages, tools, signal) {

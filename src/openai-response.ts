@@ -11,6 +11,7 @@ import { normalizeBaseUrl } from "./openai-compat.js";
 import type { MediaReaders } from "./media-readers.js";
 import { blocksToText } from "./types.js";
 import { reconstructDynamicBlocks } from "./dynamic-system.js";
+import { inlineTextFiles } from "./inline-text-files.js";
 
 /**
  * OpenAI Responses API adapter — `/v1/responses`.
@@ -118,12 +119,12 @@ async function convertPartToInputContent(p: ContentPart, readers: MediaReaders):
   }
 
   if (p.type === "text_file") {
-    try {
-      const { bytes } = await readers.readFileBytes(p);
-      return { type: "input_text", text: `[file: ${p.path}]\n${bytes.toString("utf8")}` };
-    } catch {
-      return { type: "input_text", text: `[file unavailable: ${p.path}]` };
-    }
+    // Pipeline invariant: shape's `inlineTextFiles` must have replaced this
+    // with a plain `text` part before reaching the wire converter.
+    throw new Error(
+      `[openai-response convertPartToInputContent] received text_file part — ` +
+      `shape pipeline did not run inlineTextFiles. Path: ${p.path}`,
+    );
   }
 
   if (p.type === "file") {
@@ -639,8 +640,8 @@ function supportedEffortsFor(model: string): readonly ReasoningEffort[] {
 
 function createOpenAIResponseProvider(opts: ProviderFactoryOpts): LLMProvider {
   return {
-    async prepareInboundMessages(messages, _context) {
-      return messages;
+    async shapeMessages(messages, _context) {
+      return await inlineTextFiles(messages, opts.readers);
     },
     async *chatStream(system, messages, tools, signal) {
       yield* openAIResponseStream(

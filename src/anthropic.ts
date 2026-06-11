@@ -17,6 +17,8 @@ import {
   type ImagePreflightPolicy,
 } from "./image-compression.js";
 import { foldDynamicReminders } from "./dynamic-system.js";
+import { inlineTextFiles } from "./inline-text-files.js";
+import { applyImageCache } from "./image-cache-helper.js";
 
 export type AnthropicAssistantBlock =
   | { type: "text"; text: string }
@@ -80,7 +82,7 @@ const ANTHROPIC_SUPPORTED_DOCUMENT_MIME_TYPES = new Set([
   "application/pdf",
 ]);
 
-const IMAGE_POLICY: ImagePreflightPolicy = {
+export const IMAGE_POLICY: ImagePreflightPolicy = {
   maxBase64Bytes: ANTHROPIC_IMAGE_MAX_BASE64_BYTES,
   maxLongEdge: 2000,
   compressOversized: true,
@@ -116,20 +118,14 @@ async function convertPartToAnthropic(p: ContentPart, readers: MediaReaders): Pr
   }
 
   if (p.type === "text_file") {
-    // text_file is always inlined as a text block (path label + UTF-8 body),
-    // never routed through the native `document` channel. The deployed
-    // Anthropic backend is Bedrock-Anthropic (via the forgeax proxy), whose
-    // `document.source.base64.media_type` is a single-value enum that only
-    // accepts `application/pdf` — `text/plain` / `text/markdown` documents are
-    // rejected outright. Inlining also costs no base64 inflation and works
-    // uniformly across every backend. Native `document` is reserved for PDF
-    // (see the `file` branch below, gated on ANTHROPIC_SUPPORTED_DOCUMENT_MIME_TYPES).
-    try {
-      const { bytes } = await readers.readFileBytes(p);
-      return { type: "text", text: `[file: ${p.path}]\n${bytes.toString("utf8")}` };
-    } catch {
-      return { type: "text", text: `[file unavailable: ${p.path}]` };
-    }
+    // Pipeline invariant: text_file must have been inlined upstream by
+    // the shape pipeline's `inlineTextFiles` helper. Reaching this point
+    // means shape did not run — throw to surface the misconfiguration
+    // rather than silently double-handle.
+    throw new Error(
+      `[anthropic convertPartToAnthropic] received text_file part — shape ` +
+      `pipeline did not run inlineTextFiles. Path: ${p.path}`,
+    );
   }
 
   if (p.type === "file") {
@@ -605,8 +601,16 @@ function createAnthropicProvider(opts: ProviderFactoryOpts): LLMProvider {
   }
 
   return {
-    async prepareInboundMessages(messages, _context) {
-      return messages;
+    async shapeMessages(messages, context) {
+      const inlined = await inlineTextFiles(messages, readers);
+      return await applyImageCache(
+        inlined,
+        readers,
+        opts.shapeCache,
+        IMAGE_POLICY,
+        "anthropic",
+        context.signal,
+      );
     },
     async *chatStream(system, messages, tools, signal) {
       // `system` is stable-only → the `system` field. Dynamic blocks ride in

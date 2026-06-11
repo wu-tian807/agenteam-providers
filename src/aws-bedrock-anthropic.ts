@@ -30,12 +30,15 @@ import {
   isAdaptiveOnlyModel,
   supportsMidConvoSystem,
   supportsFastMode,
+  IMAGE_POLICY,
 } from "./anthropic.js";
 import { downgradeEffort } from "./provider.js";
 import { sigv4Sign } from "./aws-sigv4.js";
 import { parseAwsEventStream } from "./aws-eventstream.js";
 import { foldDynamicReminders } from "./dynamic-system.js";
 import { throwHttpApiError } from "./errors.js";
+import { inlineTextFiles } from "./inline-text-files.js";
+import { applyImageCache } from "./image-cache-helper.js";
 
 interface BedrockExtras {
   awsAccessKeyId?: string;
@@ -76,8 +79,16 @@ function createBedrockAnthropicProvider(opts: ProviderFactoryOpts): LLMProvider 
   const fast = opts.fast;
 
   return {
-    async prepareInboundMessages(messages, _context) {
-      return messages;
+    async shapeMessages(messages, context) {
+      const inlined = await inlineTextFiles(messages, readers);
+      return await applyImageCache(
+        inlined,
+        readers,
+        opts.shapeCache,
+        IMAGE_POLICY,
+        "aws-bedrock-anthropic",
+        context.signal,
+      );
     },
     async *chatStream(system, messages, tools, signal) {
       const stable = system ?? [];

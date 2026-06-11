@@ -3,11 +3,12 @@
 import { createPartFromUri, GoogleGenAI } from "@google/genai";
 import type { ContentPart, ToolSchema } from "@agenteam/types";
 import { isFileMediaContentPart, isInlineMediaContentPart } from "@agenteam/types";
-import type { LLMMessage } from "./types.js";
+import type { LLMMessage, ShapeMessagesContext, ShapeCache } from "./types.js";
 import type { MediaReaders } from "./media-readers.js";
 import { listSupported } from "./types.js";
-
-const GEMINI_INLINE_FILE_API_THRESHOLD_BYTES = 20 * 1024 * 1024;
+import { computeSourceKey } from "./shape-cache.js";
+import { inlineTextFiles } from "./inline-text-files.js";
+import { applyGeminiFilesApi, type GeminiFileRefMap } from "./files-api-helper.js";
 
 const GEMINI_SUPPORTED_IMAGE_MIME_TYPES = new Set([
   "image/heif",
@@ -62,67 +63,14 @@ export function describeGeminiError(err: unknown): Record<string, unknown> {
   return read(err) ?? { value: String(err) };
 }
 
-interface GoogleFileRef {
-  index: number;
-  uri: string;
-  mimeType: string;
-  name?: string;
-}
-
+/** Slim record for usageMetadata yield path. Historic `fileRefs` written by
+ *  the now-removed inbound `prepareInboundMessages` path are silently ignored
+ *  by readers — the new shape pipeline reconstructs Files API URIs at
+ *  buildPrompt time, no WAL persistence. Other Google sidecar fields (e.g.
+ *  thoughtSignature, thinkingSignature, textSignature) are gemini3-specific
+ *  and travel through their own typed channels. */
 interface GoogleMessageSidecarRecord {
-  fileRefs?: GoogleFileRef[];
-  /** Raw Gemini API usageMetadata object — full passthrough, not enumerated. New API
-   *  fields automatically captured. Schema: `promptTokenCount`, `candidatesTokenCount`,
-   *  `thoughtsTokenCount`, `cachedContentTokenCount`, `toolUsePromptTokenCount`,
-   *  `totalTokenCount`, `promptTokensDetails[]`, `candidatesTokensDetails[]` (per-modality
-   *  TEXT/IMAGE/AUDIO/VIDEO breakdowns).
-   *  Named `usage_raw` (not `usage`) to avoid collision with the framework-level
-   *  outer `usage: { inputTokens, outputTokens }` standardized aggregate. */
   usage_raw?: Record<string, unknown>;
-}
-
-function readGoogleMessageSidecarRecord(msg: LLMMessage): GoogleMessageSidecarRecord | null {
-  const raw = msg.providerSidecarData?.google;
-  if (!raw || typeof raw !== "object") return null;
-  const entry = raw as Record<string, unknown>;
-  const fileRefs = Array.isArray(entry.fileRefs)
-    ? entry.fileRefs.flatMap((item): GoogleFileRef[] => {
-        if (!item || typeof item !== "object") return [];
-        const ref = item as Record<string, unknown>;
-        return typeof ref.index === "number"
-          && typeof ref.uri === "string"
-          && typeof ref.mimeType === "string"
-          ? [{
-              index: ref.index,
-              uri: ref.uri,
-              mimeType: ref.mimeType,
-              name: typeof ref.name === "string" ? ref.name : undefined,
-            }]
-          : [];
-      })
-    : undefined;
-  return fileRefs?.length ? { fileRefs } : null;
-}
-
-function mergeGoogleSidecarData(
-  msg: LLMMessage,
-  patch: Record<string, unknown>,
-): LLMMessage {
-  const current = msg.providerSidecarData;
-  const googleCurrent =
-    current?.google && typeof current.google === "object"
-      ? current.google as Record<string, unknown>
-      : {};
-  return {
-    ...msg,
-    providerSidecarData: {
-      ...(current ?? {}),
-      google: {
-        ...googleCurrent,
-        ...patch,
-      },
-    },
-  };
 }
 
 function sanitizeGeminiSchema(schema: unknown): unknown {
@@ -172,30 +120,42 @@ export function toolDefsToGemini(tools?: ToolSchema[]): any[] | undefined {
   ];
 }
 
-export async function contentPartsToGemini(content: ContentPart[], readers: MediaReaders, message?: LLMMessage): Promise<any[]> {
-  const fileRefsByIndex = new Map(
-    (message ? readGoogleMessageSidecarRecord(message)?.fileRefs : undefined)?.map((ref) => [ref.index, ref]) ?? [],
-  );
+/**
+ * Wire-format conversion. text_file is no longer handled here — the shape
+ * pipeline (`inlineTextFiles`) replaces every text_file with a plain text
+ * part before this function ever sees the message. Hitting one here is a
+ * pipeline bug, not a runtime situation; assertion enforces that contract.
+ *
+ * `fileRefMap` (closure-scoped, owned by the gemini2/gemini3 provider) maps
+ * a part's srcKey → its already-uploaded Files API ref. When a part has a
+ * fresh ref the wire-format part becomes `createPartFromUri(...)`, otherwise
+ * we fall through to inline encoding (mime-gated by Gemini's supported sets).
+ */
+export async function contentPartsToGemini(
+  content: ContentPart[],
+  readers: MediaReaders,
+  fileRefMap?: GeminiFileRefMap,
+): Promise<any[]> {
   const parts: any[] = [];
-  for (let index = 0; index < content.length; index++) {
-    const p = content[index];
+  for (const p of content) {
     if (p.type === "text") { parts.push({ text: p.text }); continue; }
 
-    const uploadedRef = fileRefsByIndex.get(index);
-    if (uploadedRef) {
-      parts.push(createPartFromUri(uploadedRef.uri, uploadedRef.mimeType));
-      continue;
+    if (p.type === "text_file") {
+      // Pipeline invariant: text_file must have been inlined upstream.
+      throw new Error(
+        `[gemini contentPartsToGemini] received text_file part — shape pipeline ` +
+        `did not run inlineTextFiles. Path: ${p.path}`,
+      );
     }
 
-    if (p.type === "text_file") {
-      try {
-        const { bytes, mimeType } = await readers.readFileBytes(p);
-        parts.push({ text: `[file: ${p.path}]` });
-        parts.push({ inlineData: { data: bytes.toString("base64"), mimeType: mimeType ?? "text/plain" } });
-      } catch {
-        parts.push({ text: `[file unavailable: ${p.path}]` });
+    // If a Files API ref is available for this source, prefer it over inline.
+    if (fileRefMap) {
+      const srcKey = computeSourceKey(p);
+      const ref = fileRefMap.get(srcKey);
+      if (ref) {
+        parts.push(createPartFromUri(ref.uri, ref.mimeType));
+        continue;
       }
-      continue;
     }
 
     if (p.type === "file") {
@@ -253,86 +213,31 @@ export async function contentPartsToGemini(content: ContentPart[], readers: Medi
   return parts;
 }
 
-export async function prepareGeminiInboundMessages(
+/**
+ * Gemini's shape pipeline:
+ *   1. inlineTextFiles — replace every `text_file` with utf-8 text part.
+ *   2. applyGeminiFilesApi — for parts > 20MB, ensure a Files API ref
+ *      exists in `fileRefMap` (re-use cached URIs across restarts).
+ *
+ * Output messages flow into ledger.json + wire only — never WAL.
+ */
+export async function shapeGeminiMessages(
   client: GoogleGenAI,
   messages: LLMMessage[],
   readers: MediaReaders,
-  signal: AbortSignal,
+  shapeCache: ShapeCache | undefined,
+  fileRefMap: GeminiFileRefMap,
+  ctx: ShapeMessagesContext,
 ): Promise<LLMMessage[]> {
-  return await Promise.all(messages.map(async (msg) => await prepareGeminiInboundMessage(client, msg, readers, signal)));
-}
-
-async function prepareGeminiInboundMessage(
-  client: GoogleGenAI,
-  msg: LLMMessage,
-  readers: MediaReaders,
-  signal: AbortSignal,
-): Promise<LLMMessage> {
-  if (msg.role !== "user") {
-    return msg;
-  }
-
-  const existingRefs = readGoogleMessageSidecarRecord(msg)?.fileRefs ?? [];
-  const existingIndexes = new Set(existingRefs.map((ref) => ref.index));
-  const uploadedRefs: GoogleFileRef[] = [...existingRefs];
-
-  for (const [index, part] of msg.content.entries()) {
-    if (signal.aborted || existingIndexes.has(index)) continue;
-    const uploadTarget = await resolveGeminiUploadTarget(part, readers);
-    if (!uploadTarget) continue;
-    const uploaded = await client.files.upload({
-      file: uploadTarget.file,
-      config: { mimeType: uploadTarget.mimeType },
-    });
-    if (!uploaded.uri) {
-      throw new Error("Gemini files.upload returned no uri");
-    }
-    uploadedRefs.push({
-      index,
-      uri: uploaded.uri,
-      mimeType: uploaded.mimeType ?? uploadTarget.mimeType,
-      name: uploaded.name,
-    });
-  }
-
-  return uploadedRefs.length > 0
-    ? mergeGoogleSidecarData(msg, { fileRefs: uploadedRefs })
-    : msg;
-}
-
-async function resolveGeminiUploadTarget(
-  part: ContentPart,
-  readers: MediaReaders,
-): Promise<{ file: Blob; mimeType: string } | null> {
-  // All branches route through the single dispatch points readMediaBytes /
-  // readFileBytes — host-supplied readers + magic-byte mime sniff. Returns
-  // a Blob (rather than a path) so the File API upload always receives the
-  // sniff-corrected mime and reader-resolved bytes; using `part.path` directly
-  // would bypass whatever bridge the host wired (sandbox, S3, etc.).
-  let bytes: Buffer;
-  let mimeType: string;
-  try {
-    if (isFileMediaContentPart(part)) {
-      ({ bytes, mimeType } = await readers.readMediaBytes(part));
-    } else if (part.type === "text_file" || part.type === "file") {
-      ({ bytes, mimeType } = await readers.readFileBytes(part));
-    } else if (isInlineMediaContentPart(part)) {
-      ({ bytes, mimeType } = await readers.readMediaBytes(part));
-    } else {
-      return null;
-    }
-  } catch {
-    return null;
-  }
-  // generic `file` gate on sniffed mime (not declared)
-  if (part.type === "file" && !GEMINI_SUPPORTED_FILE_MIME_TYPES.has(mimeType)) return null;
-  if (bytes.byteLength <= GEMINI_INLINE_FILE_API_THRESHOLD_BYTES) return null;
-  return {
-    // Wrap as Uint8Array view so Blob accepts it as BlobPart (Buffer's
-    // ArrayBufferLike doesn't narrow to ArrayBuffer in strict TS).
-    file: new globalThis.Blob([new Uint8Array(bytes)], { type: mimeType }),
-    mimeType,
-  };
+  const inlined = await inlineTextFiles(messages, readers);
+  return await applyGeminiFilesApi(
+    inlined,
+    readers,
+    shapeCache,
+    fileRefMap,
+    client,
+    ctx.signal,
+  );
 }
 
 function toolResultText(msg: LLMMessage): string {

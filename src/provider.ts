@@ -9,7 +9,7 @@ import {
 } from "./tool-normalizer.js";
 import type { ModelSpec, ModelsConfig, ReasoningEffort, ToolSchema } from "@agenteam/types";
 import { responseToAssistantMessage } from "./stream.js";
-import type { LLMProvider } from "./types.js";
+import type { LLMProvider, ShapeCache } from "./types.js";
 import { defaultMediaReaders, type MediaReaders } from "./media-readers.js";
 import { withRetry, calculateDelay, type RetryOptions, type RetryInfo } from "./retry.js";
 import { annotateLLMError, classifyLLMError, getRecommendedDelay } from "./errors.js";
@@ -29,6 +29,12 @@ export interface ProviderFactoryOpts {
    *  capture this in closure at construction time and never reach for a
    *  package-global state. See media-readers.ts for the interface contract. */
   readers: MediaReaders;
+  /** Optional cache backend for derived shape artefacts (image compression
+   *  output, Gemini Files API URIs). Forwarded from `ProviderDeps.shapeCache`
+   *  by `buildModelProvider` — raw adapters that compose shape helpers
+   *  capture this at construction time. Undefined → helpers degrade to
+   *  in-memory only. */
+  shapeCache?: import("./types.js").ShapeCache;
   /** Optional escape hatch for adapters whose auth model does not fit
    *  `apiKey + baseUrl` — e.g. AWS Bedrock needs `accessKeyId / secretAccessKey
    *  / sessionToken / region`. The orchestrator stuffs whatever extra fields a
@@ -398,6 +404,11 @@ export interface ProviderDeps {
   getModelSpec(model: string): ModelSpec;
   /** Read media/file bytes for ContentParts. */
   readers: MediaReaders;
+  /** Optional cache backend for derived shape artefacts (image compression
+   *  output, Gemini Files API URIs). When undefined, provider helpers degrade
+   *  to in-memory only / re-compute every buildPrompt — host injects an
+   *  `FsShapeCache` to enable cross-restart reuse. */
+  shapeCache?: ShapeCache;
 }
 
 /**
@@ -419,6 +430,7 @@ export const defaultProviderDeps: ProviderDeps = {
   },
   getModelSpec,
   readers: defaultMediaReaders,
+  shapeCache: undefined,
 };
 
 // ── Public API ───────────────────────────────────────────────────
@@ -525,6 +537,7 @@ function buildModelProvider(
     reasoningEffort: params.reasoningEffort,
     fast: modelsConfig.fast,
     readers: deps.readers,
+    shapeCache: deps.shapeCache,
     extras,
   });
   return {
@@ -532,9 +545,9 @@ function buildModelProvider(
     // Wrapper transparently delegates to provider hooks. Media hygiene is
     // handled at the storage layer (event-blob.ts size-based externalize on
     // write, media-storage.ts magic-byte mime sniff on read) — not here.
-    async prepareInboundMessages(messages, context) {
-      return provider.prepareInboundMessages
-        ? await provider.prepareInboundMessages(messages, context)
+    async shapeMessages(messages, context) {
+      return provider.shapeMessages
+        ? await provider.shapeMessages(messages, context)
         : messages;
     },
     materializeAssistantMessage(response, options) {
@@ -616,22 +629,17 @@ function buildChainProvider(
   };
 
   return {
-    async prepareInboundMessages(messages, context) {
-      const { mc, models } = resolveModels();
-      let prepared = messages;
-      const seenModels = new Set<string>();
-      for (const modelName of models) {
-        if (!modelName || seenModels.has(modelName)) continue;
-        seenModels.add(modelName);
-        try {
-          const provider = buildModelProvider({ ...mc, model: modelName }, modelName, deps);
-          prepared = await provider.prepareInboundMessages!(prepared, context);
-        } catch {
-          // Skip models that fail to resolve (e.g. not in llm_key.json);
-          // chatStream handles fallback with proper per-model error handling.
-        }
-      }
-      return prepared;
+    async shapeMessages(messages, context) {
+      // shapeMessages runs once per buildPrompt against the active (first)
+      // model. Composing every chain member's hook would over-shape (e.g.
+      // Gemini Files API upload then Anthropic image cache on the same
+      // bytes). Chain fallback at chatStream time accepts already-shaped
+      // messages — same trade-off as the previous prepareInboundMessages
+      // path, but now without writing any of it back to the WAL.
+      const provider = getFirstModelProvider();
+      return provider?.shapeMessages
+        ? await provider.shapeMessages(messages, context)
+        : messages;
     },
     materializeAssistantMessage(response, options) {
       const provider = getFirstModelProvider();
