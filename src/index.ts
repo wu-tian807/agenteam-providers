@@ -9,6 +9,13 @@ export * from "./types.js";
 export * from "./dynamic-system.js";
 export * from "./stream.js";
 export * from "./media-readers.js";
+export {
+  applyInboundTruncation,
+  MAX_INLINE_BYTES,
+  HEAD_BYTES,
+  TAIL_BYTES,
+  type InboundTruncationOptions,
+} from "./inbound-truncation.js";
 export * from "./modality.js";
 export * from "./tool-normalizer.js";
 export * from "./media-mime-sniff.js";

@@ -11,6 +11,7 @@ import type { ModelSpec, ModelsConfig, ReasoningEffort, ToolSchema } from "@agen
 import { responseToAssistantMessage } from "./stream.js";
 import type { LLMProvider } from "./types.js";
 import { defaultMediaReaders, type MediaReaders } from "./media-readers.js";
+import { applyInboundTruncation } from "./inbound-truncation.js";
 import { withRetry, calculateDelay, type RetryOptions, type RetryInfo } from "./retry.js";
 import { annotateLLMError, classifyLLMError, getRecommendedDelay } from "./errors.js";
 import { getSharedPaths, sleep } from "@agenteam/types";
@@ -532,10 +533,19 @@ function buildModelProvider(
     // Wrapper transparently delegates to provider hooks. Media hygiene is
     // handled at the storage layer (event-blob.ts size-based externalize on
     // write, media-storage.ts magic-byte mime sniff on read) — not here.
+    //
+    // `prepareInboundMessages` composes two layers:
+    //   Layer 1 (framework-shared): `applyInboundTruncation` caps oversized
+    //     `text_file` parts uniformly across every provider. Always runs.
+    //   Layer 2 (provider-specific): the adapter's own optional hook adds
+    //     side effects on top of the already-truncated view (e.g. Gemini's
+    //     Files API upload). Subclasses receive Layer 1's output directly
+    //     — no `super` call needed.
     async prepareInboundMessages(messages, context) {
+      const truncated = await applyInboundTruncation(messages, deps.readers);
       return provider.prepareInboundMessages
-        ? await provider.prepareInboundMessages(messages, context)
-        : messages;
+        ? await provider.prepareInboundMessages(truncated, context)
+        : truncated;
     },
     materializeAssistantMessage(response, options) {
       return provider.materializeAssistantMessage
