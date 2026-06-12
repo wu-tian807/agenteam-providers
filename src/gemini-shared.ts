@@ -7,7 +7,13 @@ import type { LLMMessage } from "./types.js";
 import type { MediaReaders } from "./media-readers.js";
 import { listSupported } from "./types.js";
 
-const GEMINI_INLINE_FILE_API_THRESHOLD_BYTES = 20 * 1024 * 1024;
+// Per Google AI announcement (2026-01-12), the Gemini API raised the
+// per-request inline payload limit from 20 MB to 100 MB. Anything above
+// this threshold must go through the Files API (uploaded by
+// `prepareGeminiInboundMessages` and referenced via sidecar fileRefs at
+// wire time). See:
+//   https://blog.google/innovation-and-ai/technology/developers-tools/gemini-api-new-file-limits/
+const GEMINI_INLINE_FILE_API_THRESHOLD_BYTES = 100 * 1024 * 1024;
 
 const GEMINI_SUPPORTED_IMAGE_MIME_TYPES = new Set([
   "image/heif",
@@ -172,6 +178,19 @@ export function toolDefsToGemini(tools?: ToolSchema[]): any[] | undefined {
   ];
 }
 
+/** Build a wire-time placeholder for parts that exceed the Gemini inline
+ *  size limit AND have no Files API fileRef on the sidecar (so we can
+ *  neither inline them nor reference an uploaded URI). The text body
+ *  preserves the path + size so the model can describe what it failed
+ *  to receive instead of triggering a 4xx. */
+function oversizeInlinePlaceholder(path: string, bytes: number, mimeType: string): string {
+  return (
+    `[file too large for inline: ${path} (${bytes} bytes, ${mimeType}); ` +
+    `exceeds Gemini inline limit ${GEMINI_INLINE_FILE_API_THRESHOLD_BYTES} bytes. ` +
+    `Files API upload required but no sidecar fileRef present.]`
+  );
+}
+
 export async function contentPartsToGemini(content: ContentPart[], readers: MediaReaders, message?: LLMMessage): Promise<any[]> {
   const fileRefsByIndex = new Map(
     (message ? readGoogleMessageSidecarRecord(message)?.fileRefs : undefined)?.map((ref) => [ref.index, ref]) ?? [],
@@ -190,8 +209,16 @@ export async function contentPartsToGemini(content: ContentPart[], readers: Medi
     if (p.type === "text_file") {
       try {
         const { bytes, mimeType } = await readers.readFileBytes(p);
-        parts.push({ text: `[file: ${p.path}]` });
-        parts.push({ inlineData: { data: bytes.toString("base64"), mimeType: mimeType ?? "text/plain" } });
+        if (bytes.byteLength > GEMINI_INLINE_FILE_API_THRESHOLD_BYTES) {
+          // Defensive only: Layer 1 (`applyInboundTruncation`) caps text_file
+          // at 256 KB before this point, so reaching here implies a legacy
+          // pre-Layer-1 inbound_message in WAL or a custom reader returning
+          // unexpectedly large bytes.
+          parts.push({ text: oversizeInlinePlaceholder(p.path, bytes.byteLength, mimeType ?? "text/plain") });
+        } else {
+          parts.push({ text: `[file: ${p.path}]` });
+          parts.push({ inlineData: { data: bytes.toString("base64"), mimeType: mimeType ?? "text/plain" } });
+        }
       } catch {
         parts.push({ text: `[file unavailable: ${p.path}]` });
       }
@@ -211,6 +238,10 @@ export async function contentPartsToGemini(content: ContentPart[], readers: Medi
         parts.push({ text: `[file unsupported by Gemini: ${p.path} (${mimeType})]` });
         continue;
       }
+      if (bytes.byteLength > GEMINI_INLINE_FILE_API_THRESHOLD_BYTES) {
+        parts.push({ text: oversizeInlinePlaceholder(p.path, bytes.byteLength, mimeType) });
+        continue;
+      }
       parts.push({ inlineData: { data: bytes.toString("base64"), mimeType } });
       continue;
     }
@@ -218,8 +249,12 @@ export async function contentPartsToGemini(content: ContentPart[], readers: Medi
     if (isFileMediaContentPart(p)) {
       try {
         const { bytes, mimeType } = await readers.readMediaBytes(p);
-        parts.push({ text: `[file: ${p.path}]` });
-        parts.push({ inlineData: { data: bytes.toString("base64"), mimeType } });
+        if (bytes.byteLength > GEMINI_INLINE_FILE_API_THRESHOLD_BYTES) {
+          parts.push({ text: oversizeInlinePlaceholder(p.path, bytes.byteLength, mimeType) });
+        } else {
+          parts.push({ text: `[file: ${p.path}]` });
+          parts.push({ inlineData: { data: bytes.toString("base64"), mimeType } });
+        }
       } catch {
         const mediaType = p.type.replace("_file", "");
         parts.push({ text: `[${mediaType} unavailable: ${p.path}]` });
