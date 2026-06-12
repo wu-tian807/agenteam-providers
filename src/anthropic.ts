@@ -325,13 +325,25 @@ async function messagesToAnthropic(messages: LLMMessage[], readers: MediaReaders
       let j = i;
       while (j < messages.length && messages[j].role === "tool") {
         const toolMsg = messages[j];
-        if (toolMsg.toolStatus !== "pending") {
-          toolBlocks.push({
-            type: "tool_result",
-            tool_use_id: toolMsg.toolCallId ?? "_tool",
-            content: await contentToAnthropic(toolMsg.content, readers),
-          });
+        // SSOT: `tool-normalizer.ts:normalizeToolTimeline` is the single owner of
+        // toolStatus invariants — by the time messages reach this wire converter,
+        // every `tool` role message MUST be a real result (completed/failed/
+        // synthetic/interrupted), never `pending`. Surfacing pending here would
+        // leak a `tool_use` block with no matching `tool_result` and Anthropic
+        // would reject the whole turn with HTTP 400. Fail loud instead of
+        // silently skipping (which masks the upstream contract violation).
+        if (toolMsg.toolStatus === "pending") {
+          throw new Error(
+            `messagesToAnthropic invariant violation: encountered pending tool message ` +
+            `(toolCallId=${toolMsg.toolCallId ?? "<none>"}). normalizeToolTimeline must run ` +
+            `before wire conversion — see tool-normalizer.ts contract.`,
+          );
         }
+        toolBlocks.push({
+          type: "tool_result",
+          tool_use_id: toolMsg.toolCallId ?? "_tool",
+          content: await contentToAnthropic(toolMsg.content, readers),
+        });
         j++;
       }
       if (toolBlocks.length > 0) {

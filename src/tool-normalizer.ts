@@ -1,17 +1,11 @@
 import type { ContentPart } from "@agenteam/types";
-import { contentToString, normalizeContent } from "./modality.js";
+import { normalizeContent } from "./modality.js";
 import type { LLMMessage, LLMToolCall } from "./types.js";
 
 export interface NormalizedToolTimeline {
   messages: LLMMessage[];
   changed: boolean;
   hasInterruptedToolCalls: boolean;
-}
-
-export interface PersistentToolRepair {
-  messages: LLMMessage[];
-  changed: boolean;
-  needsRepair: boolean;
 }
 
 export function isToolErrorResult(result: unknown): boolean {
@@ -141,11 +135,22 @@ export function createInterruptedToolResult(
 }
 
 /**
- * Normalize tool call / tool result pairing in memory:
- * - Drop raw tool ledger duplicates from replay
- * - Route each tool call to its best visible state
- * - Keep live in-flight calls as pending
- * - Mark dead pending/missing calls as interrupted once the conversation moved on
+ * Normalize tool call / tool result pairing in memory.
+ *
+ * Pairing rule: every assistant tool_call gets a single matching tool result
+ * in the output. WAL-persisted `pending` and missing tool messages are both
+ * synthesised as `interrupted` (a synthetic tool_result), because:
+ *
+ *   buildMessages is the LLM-call entry point, and the agent loop awaits
+ *   `runToolBatch` before reaching it — so any `pending` still in the WAL at
+ *   read time is a crash artefact (e.g. ENOSPC between writing pending and
+ *   writing the real result), never a live in-flight call.
+ *
+ * Without this, the wire-format converter (`messagesToAnthropic` skips
+ * `pending`) emits a `tool_use` block with no matching `tool_result`, which
+ * Anthropic rejects with HTTP 400. Synthesising at memory-level keeps the WAL
+ * untouched (idempotent: next read fixes it again) while guaranteeing the
+ * payload sent on-wire is always paired.
  */
 export function normalizeToolTimeline(messages: LLMMessage[]): NormalizedToolTimeline {
   const result: LLMMessage[] = [];
@@ -185,27 +190,20 @@ export function normalizeToolTimeline(messages: LLMMessage[]): NormalizedToolTim
       cursor++;
     }
 
-    const batchClosed = cursor < messages.length;
     for (const tc of msg.toolCalls) {
       const toolMsg = bestById.get(tc.id);
-      if (toolMsg) {
-        if (toolMsg.toolStatus === "pending" && batchClosed) {
-          result.push(createInterruptedToolResult(tc));
-          hasInterruptedToolCalls = true;
-          changed = true;
-        } else {
-          result.push(toolMsg);
-        }
-      } else {
-        if (batchClosed) {
-          result.push(createInterruptedToolResult(tc));
-          hasInterruptedToolCalls = true;
-          changed = true;
-        } else {
-          result.push(createPendingToolMessage(tc));
-          changed = true;
-        }
+      if (toolMsg && toolMsg.toolStatus !== "pending") {
+        // Real result (completed/failed/synthetic/interrupted) — keep as-is.
+        result.push(toolMsg);
+        continue;
       }
+      // Either no tool message at all, or a `pending` left over from a
+      // crashed previous run. Both are unpairable on-wire — synthesise an
+      // `interrupted` placeholder so Anthropic / OpenAI / etc. see a valid
+      // tool_result alongside the assistant's tool_use.
+      result.push(createInterruptedToolResult(tc));
+      hasInterruptedToolCalls = true;
+      changed = true;
     }
 
     i = cursor - 1;
@@ -215,28 +213,6 @@ export function normalizeToolTimeline(messages: LLMMessage[]): NormalizedToolTim
     messages: result,
     changed,
     hasInterruptedToolCalls,
-  };
-}
-
-export function buildPersistentToolRepair(messages: LLMMessage[]): PersistentToolRepair {
-  const normalized = normalizeToolTimeline(messages);
-  let repairChanged = false;
-  const repairedMessages = normalized.messages.map((msg) => {
-    if (msg.role === "tool" && msg.toolStatus === "interrupted") {
-      repairChanged = true;
-      return {
-        ...msg,
-        content: normalizeContent(contentToString(msg.content).replace("[Interrupted:", "[Error:")),
-        toolStatus: "synthetic" as const,
-      };
-    }
-    return msg;
-  });
-
-  return {
-    messages: repairedMessages,
-    changed: normalized.changed || repairChanged,
-    needsRepair: normalized.hasInterruptedToolCalls,
   };
 }
 
