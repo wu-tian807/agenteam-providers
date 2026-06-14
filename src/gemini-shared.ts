@@ -283,6 +283,14 @@ export async function contentPartsToGemini(content: ContentPart[], readers: Medi
       });
       continue;
     }
+    if (bytes.byteLength > GEMINI_INLINE_FILE_API_THRESHOLD_BYTES) {
+      // Inline media (embedded base64, no file path / no sidecar fileRef) has
+      // no Layer-2 Files API upload path, so an oversize part would otherwise
+      // push raw inlineData and trigger a hard Gemini 4xx. Emit the same
+      // placeholder the file branches use. Identify by `name` (path-less here).
+      parts.push({ text: oversizeInlinePlaceholder(p.name ?? `inline-${p.type}`, bytes.byteLength, sniffedMime) });
+      continue;
+    }
     parts.push({ inlineData: { data: bytes.toString("base64"), mimeType: sniffedMime } });
   }
   return parts;
