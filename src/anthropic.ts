@@ -296,7 +296,10 @@ function ensureAnthropicAssistantTrailingNonThinking(blocks: any[]): void {
   if (blocks.length === 0) return;
   const last = blocks[blocks.length - 1];
   if (last?.type === "thinking" || last?.type === "redacted_thinking") {
-    blocks.push({ type: "text", text: "" });
+    // Empty/whitespace-only text is also rejected ("text content blocks must be
+    // non-empty"). Wire-only pad for thinking-only assistant history (common on
+    // Opus 4.7+ adaptive thinking); not persisted — see community adapters.
+    blocks.push({ type: "text", text: "(continuing)" });
   }
 }
 
