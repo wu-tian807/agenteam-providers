@@ -273,7 +273,7 @@ function toAnthropicSidecar(sidecarData: LLMMessage["providerSidecarData"]): Ant
 }
 
 function anthropicBlocksToApi(blocks: AnthropicAssistantBlock[]): any[] {
-  return blocks.map((block) => {
+  const apiBlocks = blocks.map((block) => {
     switch (block.type) {
       case "thinking":
         return {
@@ -287,6 +287,17 @@ function anthropicBlocksToApi(blocks: AnthropicAssistantBlock[]): any[] {
         return block;
     }
   });
+  ensureAnthropicAssistantTrailingNonThinking(apiBlocks);
+  return apiBlocks;
+}
+
+/** Anthropic rejects assistant turns whose final content block is `thinking`. */
+function ensureAnthropicAssistantTrailingNonThinking(blocks: any[]): void {
+  if (blocks.length === 0) return;
+  const last = blocks[blocks.length - 1];
+  if (last?.type === "thinking" || last?.type === "redacted_thinking") {
+    blocks.push({ type: "text", text: "" });
+  }
 }
 
 async function fallbackAssistantBlocks(msg: LLMMessage, readers: MediaReaders): Promise<any[]> {
@@ -311,7 +322,9 @@ async function assistantMessageToAnthropicContent(msg: LLMMessage, readers: Medi
   if (sidecar?.contentBlocks.length) {
     return anthropicBlocksToApi(sidecar.contentBlocks);
   }
-  return fallbackAssistantBlocks(msg, readers);
+  const blocks = await fallbackAssistantBlocks(msg, readers);
+  ensureAnthropicAssistantTrailingNonThinking(blocks);
+  return blocks;
 }
 
 async function messagesToAnthropic(messages: LLMMessage[], readers: MediaReaders): Promise<any[]> {
