@@ -386,19 +386,17 @@ async function messagesToAnthropic(messages: LLMMessage[], readers: MediaReaders
       // it as genuine system context). Only reached on the native path; the fold
       // path strips role:"system" before conversion.
       //
-      // Anthropic requires a mid-convo system block to follow a user turn
-      // (tool_result batches convert to role:"user", so they count). Placement
-      // depends only on the previously emitted wire message:
-      //   - prev is user   → emit native system (valid).
-      //   - prev is system → merge into it (consecutive carriers collapse to one
-      //                       block that still follows the earlier user turn).
-      //   - otherwise (assistant tail / history head) → degrade THIS carrier to
-      //                       a role:"user" message so it stays valid.
+      // Native system only when prev is user/tool_result AND (tail OR next
+      // non-carrier is assistant). Otherwise degrade — e.g. user→carrier→user
+      // after a failed loop violates Anthropic's mid-convo system placement.
       const sysContent = await contentToAnthropic(msg.content, readers);
       const prev = result[result.length - 1];
+      let k = i + 1;
+      while (k < messages.length && messages[k].role === "system") k++;
+      const nativeOk = k >= messages.length || messages[k].role === "assistant";
       if (prev && prev.role === "system") {
         prev.content = [...prev.content, ...sysContent];
-      } else if (prev && prev.role === "user") {
+      } else if (prev?.role === "user" && nativeOk) {
         result.push({ role: "system", content: sysContent });
       } else {
         result.push({ role: "user", content: sysContent });
