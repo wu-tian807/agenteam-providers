@@ -234,17 +234,6 @@ function getKeyDir(): string {
   }
 }
 
-/** Always re-read from disk so key/model changes take effect without restart. */
-function loadKeyFile(): Record<string, KeyEntry> {
-  const p = resolve(getKeyDir(), "llm_key.json");
-  if (existsSync(p)) {
-    try {
-      return JSON.parse(readFileSync(p, "utf-8"));
-    } catch { /* malformed JSON */ }
-  }
-  throw new Error("Missing key/llm_key.json — copy from llm_key.example.json");
-}
-
 // ── Model catalog loading (key/models.json) ──────────────────────
 
 const DEFAULT_SPEC: ModelSpec = {
@@ -362,35 +351,24 @@ export function buildRetryOptions(modelsConfig?: ModelsConfig): RetryOptions {
   return opts;
 }
 
-// ── Model → Section resolution (scan models arrays) ─────────────
-
-function resolveSection(model: string): { sectionName: string; entry: KeyEntry } {
-  const keys = loadKeyFile();
-  for (const [name, entry] of Object.entries(keys)) {
-    if (entry.models?.includes(model)) {
-      return { sectionName: name, entry };
-    }
-  }
-  throw new Error(
-    `No key section contains model '${model}'. ` +
-    `Add it to a section's "models" array in key/llm_key.json, ` +
-    `or use "model@section" syntax to specify explicitly.`,
-  );
-}
-
 // ── Dependency injection ─────────────────────────────────────────
 
 /**
  * External dependencies a provider needs to turn a model name into a concrete
- * API call. All three default to package-shipped implementations:
- *   - `resolveKey` / `getModelSpec`: re-read `key/llm_key.json` +
- *     `key/models.json` from the shared state dir on every call.
- *   - `readers`: pure `node:fs.readFile`-backed reads (see
- *     `defaultMediaReaders`).
+ * API call.
  *
- * Hosts override individual fields (typically `readers`, when bytes need to
- * route through a sandbox/container bridge) by passing a custom object —
- * usually built once at boot and reused across every `createProvider()` call.
+ * - `resolveKey`: REQUIRED. The host decides how to read key sections — split
+ *   file (`key/llm_key.json`), merged file (`key/key.json`), Vault, in-memory
+ *   store for tests, etc. This package never reads key files on its own; the
+ *   bundled `defaultProviderDeps.resolveKey` is a throw-stub that points the
+ *   caller at the host-injection requirement.
+ * - `getModelSpec`: defaults to disk-backed `key/models.json` lookup. Hosts
+ *   may override for catalogs sourced elsewhere.
+ * - `readers`: defaults to `node:fs.readFile`. Hosts override when bytes must
+ *   route through a sandbox / container bridge.
+ *
+ * Build a custom `ProviderDeps` once at boot and reuse across every
+ * `createProvider()` call.
  */
 export interface ProviderDeps {
   /** Resolve the key section (api type, api_key, base url) for a model. */
@@ -402,21 +380,25 @@ export interface ProviderDeps {
 }
 
 /**
- * Package-default `ProviderDeps`. File-backed key/spec lookups + node:fs
- * media readers — works out of the box for any consumer reading model inputs
- * from real host filesystem paths. Hosts with a sandbox bridge override
- * `readers` with their own implementation.
+ * Package-default `ProviderDeps`. `getModelSpec` + `readers` are real
+ * implementations (disk-backed). `resolveKey` is a throw-stub — the host must
+ * inject its own (see the `ProviderDeps` doc above for why). Spread this and
+ * overlay your `resolveKey` (plus any other deps you want to swap):
+ *
+ *     const deps: ProviderDeps = {
+ *       ...defaultProviderDeps,
+ *       resolveKey: myResolveKey,   // required
+ *       readers: mySandboxReaders,  // optional
+ *     };
  */
 export const defaultProviderDeps: ProviderDeps = {
-  resolveKey(model, keySection) {
-    if (keySection) {
-      const entry = loadKeyFile()[keySection];
-      if (!entry) {
-        throw new Error(`Key section '${keySection}' not found in key/llm_key.json`);
-      }
-      return { entry, sectionName: keySection };
-    }
-    return resolveSection(model);
+  resolveKey() {
+    throw new Error(
+      "ProviderDeps.resolveKey was not injected. " +
+      "@agenteam/providers is a protocol layer and does not read key files — " +
+      "wire your own resolveKey (reading llm_key.json, fetching from Vault, etc.) " +
+      "and include it in the ProviderDeps you pass to createProvider().",
+    );
   },
   getModelSpec,
   readers: defaultMediaReaders,
