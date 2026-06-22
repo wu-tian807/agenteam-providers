@@ -1,6 +1,6 @@
 {
   "name": "@agenteam/providers",
-  "version": "1.0.17",
+  "version": "1.0.19",
   "description": "Raw LLM provider abstractions and SDK adapters — host-agnostic core for AgenTeam.",
   "type": "module",
   "main": "./src/index.ts",
